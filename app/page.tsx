@@ -40,7 +40,7 @@ async function checkCookie(raw: string): Promise<CheckResponse> {
     return {
       status: "error",
       message: "Network error: " + (err instanceof Error ? err.message : String(err)),
-      netflix_id_preview: "\u2014",
+      netflix_id_preview: "—",
     };
   }
 }
@@ -92,13 +92,13 @@ export default function Page() {
   return (
     <main>
       <header className="masthead">
-        <p className="eyebrow">netflix \u00b7 session utility</p>
+        <p className="eyebrow">netflix · session utility</p>
         <h1>
-          <span className="caret">\u203a</span> nftoken
+          <span className="caret">›</span> nftoken
         </h1>
         <p className="lede">
           Turn a Netflix session cookie into a one-tap login URL, check whether
-          cookies are still alive, and keep a saved vault \u2014 all in your browser.
+          cookies are still alive, and keep a saved vault — all in your browser.
         </p>
       </header>
 
@@ -216,7 +216,7 @@ function GeneratePanel() {
       <form onSubmit={generate}>
         <div className="field-head">
           <label htmlFor="cookie">cookie</label>
-          <span className="hint">raw header \u00b7 cookies.txt \u00b7 json</span>
+          <span className="hint">raw header · cookies.txt · json</span>
         </div>
         <textarea
           id="cookie"
@@ -230,7 +230,7 @@ function GeneratePanel() {
         />
         <div className="actions">
           <button className="primary" type="submit" disabled={loading}>
-            {loading ? "Generating\u2026" : "Generate login URL"}
+            {loading ? "Generating…" : "Generate login URL"}
           </button>
           <span className="status">only NetflixId is required</span>
         </div>
@@ -263,7 +263,7 @@ function GeneratePanel() {
           </div>
           <div className="row">
             <button className="chip solid" type="button" onClick={saveToVault}>
-              {saved ? "saved \u2713" : "save to vault"}
+              {saved ? "saved ✓" : "save to vault"}
             </button>
           </div>
         </div>
@@ -347,7 +347,7 @@ function VaultPanel() {
         expires: res.expires ?? null,
         expiryText: res.expiry_text,
         preview:
-          res.netflix_id_preview && res.netflix_id_preview !== "\u2014"
+          res.netflix_id_preview && res.netflix_id_preview !== "—"
             ? res.netflix_id_preview
             : entry.preview,
         lastChecked: Date.now(),
@@ -398,7 +398,7 @@ function VaultPanel() {
       });
       const skipped = extracted.length - fresh.length;
       if (fresh.length === 0) {
-        setSummary(`Extracted ${extracted.length} \u2014 all already in your vault.`);
+        setSummary(`Extracted ${extracted.length} — all already in your vault.`);
         return;
       }
 
@@ -422,7 +422,7 @@ function VaultPanel() {
           expires: r.expires ?? null,
           expiryText: r.expiry_text,
           preview:
-            r.netflix_id_preview && r.netflix_id_preview !== "\u2014"
+            r.netflix_id_preview && r.netflix_id_preview !== "—"
               ? r.netflix_id_preview
               : entry.preview,
           lastChecked: Date.now(),
@@ -435,7 +435,7 @@ function VaultPanel() {
       const dead = [...results.values()].filter((s) => s === "invalid").length;
       const errored = [...results.values()].filter((s) => s === "error").length;
 
-      // Drop the dead ones we just added \u2014 keep working (and errors to retry).
+      // Drop the dead ones we just added — keep working (and errors to retry).
       const deadIds = new Set(
         created.filter((c) => results.get(c.id) === "invalid").map((c) => c.id),
       );
@@ -448,8 +448,8 @@ function VaultPanel() {
       setSummary(
         `Extracted ${extracted.length}` +
           (skipped ? ` (${skipped} already saved)` : "") +
-          ` \u00b7 ${working} working saved \u00b7 ${dead} dead removed` +
-          (errored ? ` \u00b7 ${errored} error (kept)` : ""),
+          ` · ${working} working saved · ${dead} dead removed` +
+          (errored ? ` · ${errored} error (kept)` : ""),
       );
     } catch (err) {
       setSummary(
@@ -471,7 +471,7 @@ function VaultPanel() {
   async function recheck(id: string) {
     const item = items.find((it) => it.id === id);
     if (!item) return;
-    patch(id, { message: "checking\u2026" });
+    patch(id, { message: "checking…" });
     const res = await checkCookie(item.raw);
     patch(id, {
       status: res.status,
@@ -510,7 +510,7 @@ function VaultPanel() {
   async function generate(id: string) {
     const item = items.find((it) => it.id === id);
     if (!item) return;
-    patch(id, { message: "generating\u2026" });
+    patch(id, { message: "generating…" });
     try {
       const res = await fetch("/api/token", {
         method: "POST",
@@ -574,8 +574,8 @@ function VaultPanel() {
         <label className={busy ? "chip solid file-btn disabled" : "chip solid file-btn"}>
           {archiveBusy
             ? extracting
-              ? "Extracting\u2026"
-              : "Checking\u2026"
+              ? "Extracting…"
+              : "Checking…"
             : "Choose .zip / .rar"}
           <input
             type="file"
@@ -588,7 +588,7 @@ function VaultPanel() {
         <span className="status">
           {archiveBusy && progress
             ? `checked ${progress.done}/${progress.total}`
-            : "extract \u2192 validate \u2192 keep the working ones"}
+            : "extract → validate → keep the working ones"}
         </span>
       </div>
       {summary ? <div className="summary">{summary}</div> : null}
@@ -597,12 +597,12 @@ function VaultPanel() {
 
       <div className="field-head">
         <label htmlFor="bulk">or paste cookies</label>
-        <span className="hint">one per line \u00b7 or a json array</span>
+        <span className="hint">one per line · or a json array</span>
       </div>
       <textarea
         id="bulk"
         spellCheck={false}
-        placeholder={"NetflixId=...\\nNetflixId=...\\nNetflixId=..."}
+        placeholder={"NetflixId=...\nNetflixId=...\nNetflixId=..."}
         value={bulk}
         onChange={(e) => setBulk(e.target.value)}
       />
@@ -613,7 +613,7 @@ function VaultPanel() {
           onClick={importBulk}
           disabled={busy || !bulk.trim()}
         >
-          {importing ? "Importing\u2026" : "Import & check"}
+          {importing ? "Importing…" : "Import & check"}
         </button>
         {importing && progress ? (
           <span className="status">
@@ -644,7 +644,7 @@ function VaultPanel() {
             onClick={recheckAll}
             disabled={busy || items.length === 0}
           >
-            {checkingAll ? "checking\u2026" : "re-check all"}
+            {checkingAll ? "checking…" : "re-check all"}
           </button>
           <button
             className="chip"
@@ -668,7 +668,7 @@ function VaultPanel() {
       {items.length === 0 ? (
         <div className="empty">
           No saved cookies yet. Upload a <strong>.zip/.rar</strong> or paste some
-          above \u2014 the working ones are kept with a <strong>Generate</strong>
+          above — the working ones are kept with a <strong>Generate</strong>
           button.
         </div>
       ) : (
@@ -691,13 +691,13 @@ function VaultPanel() {
                   </div>
                   <div className="ci-sub">
                     {it.label ? (
-                      <span className="ci-dim">NetflixId {it.preview} \u00b7 </span>
+                      <span className="ci-dim">NetflixId {it.preview} · </span>
                     ) : null}
                     {it.status === "working" && it.expiryText
                       ? `expires ${it.expiryText}`
-                      : it.message || "\u2014"}
+                      : it.message || "—"}
                     <span className="ci-dim">
-                      {" \u00b7 checked "}
+                      {" · checked "}
                       {relativeTime(it.lastChecked)}
                     </span>
                   </div>
@@ -768,9 +768,9 @@ function VaultPanel() {
         <span className="tag">privacy</span>
         <span>
           Archives are extracted and checked on the server but never stored or
-          logged. Saved cookies live in this browser\u2019s local storage \u2014 not on the
-          server. Anyone with access to this device can read them. Use \u201cclear
-          all\u201d on a shared computer.
+          logged. Saved cookies live in this browser’s local storage — not on the
+          server. Anyone with access to this device can read them. Use “clear
+          all” on a shared computer.
         </span>
       </div>
     </section>

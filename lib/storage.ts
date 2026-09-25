@@ -40,7 +40,7 @@ export function persistSaved(items: SavedCookie[]): void {
   try {
     window.localStorage.setItem(KEY, JSON.stringify(items));
   } catch {
-    // storage full or blocked \u2014 ignore
+    // storage full or blocked — ignore
   }
 }
 
