@@ -1,3 +1,0 @@
-line one
-line two backslash a\b
-line three end
