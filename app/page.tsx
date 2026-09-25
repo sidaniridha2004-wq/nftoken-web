@@ -1,7 +1,14 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { splitBulkCookies } from "@/lib/cookies";
+import {
+  ChangeEvent,
+  FormEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
+import { extractCookieDict, splitBulkCookies } from "@/lib/cookies";
 import {
   SavedCookie,
   SavedStatus,
@@ -110,14 +117,14 @@ export default function Page() {
           className={tab === "vault" ? "tab active" : "tab"}
           onClick={() => setTab("vault")}
         >
-          Vault &amp; bulk check
+          Vault, import &amp; check
         </button>
       </nav>
 
       {tab === "generate" ? <GeneratePanel /> : <VaultPanel />}
 
       <footer>
-        <span>v2.0.0</span>
+        <span>v2.1.0</span>
         <span className="sep">/</span>
         <a
           href="https://github.com/sidaniridha2004-wq/nftoken-web"
@@ -279,6 +286,10 @@ function VaultPanel() {
   const [bulk, setBulk] = useState("");
   const [importing, setImporting] = useState(false);
   const [checkingAll, setCheckingAll] = useState(false);
+  const [archiveBusy, setArchiveBusy] = useState(false);
+  const [extracting, setExtracting] = useState(false);
+  const [summary, setSummary] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(
     null,
   );
@@ -298,26 +309,31 @@ function VaultPanel() {
     return c;
   }, [items]);
 
-  const patch = useCallback(
-    (id: string, changes: Partial<SavedCookie>) => {
-      setItems((prev) => {
-        const next = prev.map((it) =>
-          it.id === id ? { ...it, ...changes } : it,
-        );
-        persistSaved(next);
-        return next;
-      });
-    },
-    [],
-  );
+  const patch = useCallback((id: string, changes: Partial<SavedCookie>) => {
+    setItems((prev) => {
+      const next = prev.map((it) => (it.id === id ? { ...it, ...changes } : it));
+      persistSaved(next);
+      return next;
+    });
+  }, []);
+
+  const toggleExpanded = useCallback((id: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const busy = importing || checkingAll || archiveBusy;
 
   async function importBulk() {
     const entries = splitBulkCookies(bulk);
     if (entries.length === 0) return;
     setImporting(true);
     const created = entries.map((raw) => newSavedCookie(raw));
-    const next = [...created, ...items];
-    update(next);
+    update([...created, ...items]);
     setBulk("");
 
     setProgress({ done: 0, total: created.length });
@@ -343,10 +359,114 @@ function VaultPanel() {
     setImporting(false);
   }
 
+  async function importArchive(file: File) {
+    setSummary(null);
+    if (file.size > 4 * 1024 * 1024) {
+      setSummary("That archive is larger than 4 MB. Please split it into smaller files.");
+      return;
+    }
+    setArchiveBusy(true);
+    setExtracting(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await fetch("/api/extract", { method: "POST", body: fd });
+      const data = await res.json();
+      setExtracting(false);
+      if (!res.ok) {
+        setSummary(data.error || "Could not read the archive.");
+        return;
+      }
+      const extracted = (data.cookies ?? []) as {
+        source: string;
+        cookie: string;
+        label: string;
+      }[];
+      if (extracted.length === 0) {
+        setSummary("No Netflix cookies found in that archive.");
+        return;
+      }
+
+      // Skip cookies already in the vault (matched by NetflixId).
+      const existing = new Set(
+        items.map((it) => extractCookieDict(it.raw)["NetflixId"]).filter(Boolean),
+      );
+      const fresh = extracted.filter((c) => {
+        const id = extractCookieDict(c.cookie)["NetflixId"];
+        return id && !existing.has(id);
+      });
+      const skipped = extracted.length - fresh.length;
+      if (fresh.length === 0) {
+        setSummary(`Extracted ${extracted.length} — all already in your vault.`);
+        return;
+      }
+
+      const created = fresh.map((c) => newSavedCookie(c.cookie, c.label, c.source));
+      update([...created, ...items]);
+
+      setProgress({ done: 0, total: created.length });
+      let done = 0;
+      const results = new Map<string, SavedStatus>();
+      await pool(created, 6, async (entry) => {
+        const r = await checkCookie(entry.raw);
+        results.set(entry.id, r.status);
+        patch(entry.id, {
+          status: r.status,
+          message: r.message,
+          loginUrl: r.login_url,
+          expires: r.expires ?? null,
+          expiryText: r.expiry_text,
+          preview:
+            r.netflix_id_preview && r.netflix_id_preview !== "—"
+              ? r.netflix_id_preview
+              : entry.preview,
+          lastChecked: Date.now(),
+        });
+        done++;
+        setProgress({ done, total: created.length });
+      });
+
+      const working = [...results.values()].filter((s) => s === "working").length;
+      const dead = [...results.values()].filter((s) => s === "invalid").length;
+      const errored = [...results.values()].filter((s) => s === "error").length;
+
+      // Drop the dead ones we just added — keep working (and errors to retry).
+      const deadIds = new Set(
+        created.filter((c) => results.get(c.id) === "invalid").map((c) => c.id),
+      );
+      setItems((prev) => {
+        const next = prev.filter((it) => !deadIds.has(it.id));
+        persistSaved(next);
+        return next;
+      });
+
+      setSummary(
+        `Extracted ${extracted.length}` +
+          (skipped ? ` (${skipped} already saved)` : "") +
+          ` · ${working} working saved · ${dead} dead removed` +
+          (errored ? ` · ${errored} error (kept)` : ""),
+      );
+    } catch (err) {
+      setSummary(
+        "Upload failed: " + (err instanceof Error ? err.message : String(err)),
+      );
+    } finally {
+      setExtracting(false);
+      setProgress(null);
+      setArchiveBusy(false);
+    }
+  }
+
+  function onFile(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (file) void importArchive(file);
+  }
+
   async function recheck(id: string) {
     const item = items.find((it) => it.id === id);
     if (!item) return;
-    patch(id, { status: item.status, message: "checking…" });
+    patch(id, { message: "checking…" });
     const res = await checkCookie(item.raw);
     patch(id, {
       status: res.status,
@@ -364,7 +484,7 @@ function VaultPanel() {
     setProgress({ done: 0, total: items.length });
     let done = 0;
     const snapshot = [...items];
-    await pool(snapshot, 4, async (item) => {
+    await pool(snapshot, 6, async (item) => {
       const res = await checkCookie(item.raw);
       patch(item.id, {
         status: res.status,
@@ -379,6 +499,42 @@ function VaultPanel() {
     });
     setProgress(null);
     setCheckingAll(false);
+  }
+
+  /** (Re)generate a fresh login URL for a working cookie and reveal it. */
+  async function generate(id: string) {
+    const item = items.find((it) => it.id === id);
+    if (!item) return;
+    patch(id, { message: "generating…" });
+    try {
+      const res = await fetch("/api/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cookie: item.raw }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        patch(id, { message: data.error || "Could not generate a URL." });
+        return;
+      }
+      patch(id, {
+        status: "working",
+        loginUrl: data.login_url,
+        expiryText: data.expiry_text,
+        lastChecked: Date.now(),
+        message: undefined,
+      });
+      setExpanded((prev) => new Set(prev).add(id));
+      try {
+        await navigator.clipboard.writeText(data.login_url);
+      } catch {
+        /* clipboard blocked */
+      }
+    } catch (err) {
+      patch(id, {
+        message: "Network error: " + (err instanceof Error ? err.message : String(err)),
+      });
+    }
   }
 
   function remove(id: string) {
@@ -403,12 +559,39 @@ function VaultPanel() {
     }
   }
 
-  const busy = importing || checkingAll;
-
   return (
     <section className="panel">
       <div className="field-head">
-        <label htmlFor="bulk">bulk import</label>
+        <label>import from archive</label>
+        <span className="hint">.zip or .rar of cookie files</span>
+      </div>
+      <div className="uploader">
+        <label className={busy ? "chip solid file-btn disabled" : "chip solid file-btn"}>
+          {archiveBusy
+            ? extracting
+              ? "Extracting…"
+              : "Checking…"
+            : "Choose .zip / .rar"}
+          <input
+            type="file"
+            accept=".zip,.rar,application/zip,application/x-rar-compressed,application/vnd.rar"
+            hidden
+            disabled={busy}
+            onChange={onFile}
+          />
+        </label>
+        <span className="status">
+          {archiveBusy && progress
+            ? `checked ${progress.done}/${progress.total}`
+            : "extract → validate → keep the working ones"}
+        </span>
+      </div>
+      {summary ? <div className="summary">{summary}</div> : null}
+
+      <hr className="rule" />
+
+      <div className="field-head">
+        <label htmlFor="bulk">or paste cookies</label>
         <span className="hint">one per line · or a json array</span>
       </div>
       <textarea
@@ -427,7 +610,7 @@ function VaultPanel() {
         >
           {importing ? "Importing…" : "Import & check"}
         </button>
-        {progress ? (
+        {importing && progress ? (
           <span className="status">
             checked {progress.done}/{progress.total}
           </span>
@@ -479,8 +662,9 @@ function VaultPanel() {
 
       {items.length === 0 ? (
         <div className="empty">
-          No saved cookies yet. Paste some above and hit
-          <strong> Import &amp; check</strong>.
+          No saved cookies yet. Upload a <strong>.zip/.rar</strong> or paste some
+          above — the working ones are kept with a <strong>Generate</strong>
+          button.
         </div>
       ) : (
         <ul className="cookie-list">
@@ -490,12 +674,17 @@ function VaultPanel() {
                 <span className={`dot ${it.status}`} aria-hidden />
                 <div className="ci-text">
                   <div className="ci-top">
-                    <span className="ci-id">NetflixId {it.preview}</span>
+                    <span className="ci-id">
+                      {it.label || `NetflixId ${it.preview}`}
+                    </span>
                     <span className={`pill ${it.status}`}>
                       {statusLabel(it.status)}
                     </span>
                   </div>
                   <div className="ci-sub">
+                    {it.label ? (
+                      <span className="ci-dim">NetflixId {it.preview} · </span>
+                    ) : null}
                     {it.status === "working" && it.expiryText
                       ? `expires ${it.expiryText}`
                       : it.message || "—"}
@@ -504,27 +693,47 @@ function VaultPanel() {
                       {relativeTime(it.lastChecked)}
                     </span>
                   </div>
+                  {expanded.has(it.id) && it.loginUrl ? (
+                    <div className="ci-url">
+                      <span className="url-box">{it.loginUrl}</span>
+                      <button
+                        className="chip"
+                        type="button"
+                        onClick={() => copy(it.loginUrl)}
+                      >
+                        copy
+                      </button>
+                      <a
+                        className="chip"
+                        href={it.loginUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        open
+                      </a>
+                    </div>
+                  ) : null}
                 </div>
               </div>
               <div className="ci-actions">
+                {it.status === "working" ? (
+                  <button
+                    className="chip solid"
+                    type="button"
+                    onClick={() => generate(it.id)}
+                    disabled={busy}
+                  >
+                    generate
+                  </button>
+                ) : null}
                 {it.status === "working" && it.loginUrl ? (
-                  <>
-                    <button
-                      className="chip"
-                      type="button"
-                      onClick={() => copy(it.loginUrl)}
-                    >
-                      copy url
-                    </button>
-                    <a
-                      className="chip"
-                      href={it.loginUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                    >
-                      open
-                    </a>
-                  </>
+                  <button
+                    className="chip"
+                    type="button"
+                    onClick={() => toggleExpanded(it.id)}
+                  >
+                    {expanded.has(it.id) ? "hide" : "url"}
+                  </button>
                 ) : null}
                 <button
                   className="chip"
@@ -550,9 +759,10 @@ function VaultPanel() {
       <div className="note">
         <span className="tag">privacy</span>
         <span>
-          Saved cookies live in this browser’s local storage — not on the server.
-          Anyone with access to this device can read them. Use “clear all” on a
-          shared computer.
+          Archives are extracted and checked on the server but never stored or
+          logged. Saved cookies live in this browser’s local storage — not on the
+          server. Anyone with access to this device can read them. Use “clear
+          all” on a shared computer.
         </span>
       </div>
     </section>
