@@ -2,6 +2,7 @@
 
 import {
   ChangeEvent,
+  Fragment,
   FormEvent,
   useCallback,
   useEffect,
@@ -293,6 +294,7 @@ function VaultPanel() {
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(
     null,
   );
+  const [countryFilter, setCountryFilter] = useState<string>("all");
 
   useEffect(() => {
     setItems(loadSaved());
@@ -308,6 +310,52 @@ function VaultPanel() {
     for (const it of items) c[it.status]++;
     return c;
   }, [items]);
+
+  const countryCounts = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const it of items) {
+      const key = it.country || "";
+      m.set(key, (m.get(key) || 0) + 1);
+    }
+    return m;
+  }, [items]);
+
+  const hasCountries = useMemo(
+    () => items.some((it) => it.country),
+    [items],
+  );
+
+  const countryOptions = useMemo(() => {
+    return [...countryCounts.entries()].sort((a, b) => {
+      if (a[0] === "") return 1;
+      if (b[0] === "") return -1;
+      return a[0].localeCompare(b[0]);
+    });
+  }, [countryCounts]);
+
+  const visibleItems = useMemo(() => {
+    const base =
+      countryFilter === "all"
+        ? items.slice()
+        : items.filter((it) => (it.country || "") === countryFilter);
+    if (!hasCountries) return base;
+    const order = new Map(countryOptions.map(([code], i) => [code, i]));
+    return base
+      .map((it, i) => ({ it, i }))
+      .sort((a, b) => {
+        const ca = order.get(a.it.country || "") ?? 0;
+        const cb = order.get(b.it.country || "") ?? 0;
+        if (ca !== cb) return ca - cb;
+        return a.i - b.i;
+      })
+      .map((x) => x.it);
+  }, [items, countryFilter, hasCountries, countryOptions]);
+
+  useEffect(() => {
+    if (countryFilter !== "all" && !countryCounts.has(countryFilter)) {
+      setCountryFilter("all");
+    }
+  }, [countryFilter, countryCounts]);
 
   const patch = useCallback((id: string, changes: Partial<SavedCookie>) => {
     setItems((prev) => {
@@ -638,6 +686,21 @@ function VaultPanel() {
           ) : null}
         </div>
         <div className="vault-tools">
+          {hasCountries ? (
+            <select
+              className="cf-select"
+              aria-label="Filter by country"
+              value={countryFilter}
+              onChange={(e) => setCountryFilter(e.target.value)}
+            >
+              <option value="all">All countries ({items.length})</option>
+              {countryOptions.map(([code, n]) => (
+                <option key={code || "__none__"} value={code}>
+                  {(code || "No country") + " (" + n + ")"}
+                </option>
+              ))}
+            </select>
+          ) : null}
           <button
             className="chip"
             type="button"
@@ -673,8 +736,22 @@ function VaultPanel() {
         </div>
       ) : (
         <ul className="cookie-list">
-          {items.map((it) => (
-            <li key={it.id} className="cookie-item">
+          {visibleItems.map((it, idx) => {
+            const groupKey = it.country || "";
+            const prevKey =
+              idx > 0 ? visibleItems[idx - 1].country || "" : null;
+            const showHeader = hasCountries && groupKey !== prevKey;
+            return (
+              <Fragment key={it.id}>
+                {showHeader ? (
+                  <li className="cookie-group">
+                    <span className="cg-name">{it.country || "No country"}</span>
+                    <span className="cg-count">
+                      {countryCounts.get(groupKey)}
+                    </span>
+                  </li>
+                ) : null}
+                <li className="cookie-item">
               <div className="ci-main">
                 <span className={`dot ${it.status}`} aria-hidden />
                 <div className="ci-text">
@@ -759,8 +836,10 @@ function VaultPanel() {
                   delete
                 </button>
               </div>
-            </li>
-          ))}
+                </li>
+              </Fragment>
+            );
+          })}
         </ul>
       )}
 
