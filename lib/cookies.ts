@@ -84,3 +84,69 @@ export function extractCookieDict(text: string): Record<string, string> {
 
   return cookieDict;
 }
+
+/**
+ * Split a bulk paste into individual cookie entries.
+ *
+ * Supported bulk shapes:
+ *   - One cookie per line (raw header, or a single NetflixId=...).
+ *   - A JSON array of strings: ["NetflixId=...", "NetflixId=..."].
+ *   - A JSON array of cookie-export objects, split into one entry each.
+ *   - Blocks separated by a blank line or a line of dashes (for multi-line
+ *     JSON exports pasted back-to-back).
+ */
+export function splitBulkCookies(text: string): string[] {
+  const trimmed = text.trim();
+  if (!trimmed) return [];
+
+  // Whole-input JSON array handling.
+  try {
+    const data: unknown = JSON.parse(trimmed);
+    if (Array.isArray(data)) {
+      // Array of plain strings -> one entry per string.
+      if (data.every((item) => typeof item === "string")) {
+        return (data as string[]).map((s) => s.trim()).filter(Boolean);
+      }
+      // Array of export objects: keep the whole array as one entry only if it
+      // looks like a single browser export; otherwise split per object.
+      const objects = data.filter(
+        (item) => item && typeof item === "object",
+      ) as Record<string, unknown>[];
+      const hasNetflixId = (o: Record<string, unknown>) =>
+        o.name === "NetflixId" || "NetflixId" in o;
+      const perObject = objects.filter(hasNetflixId);
+      if (perObject.length > 1) {
+        return perObject.map((o) => JSON.stringify(o));
+      }
+      return [trimmed];
+    }
+  } catch {
+    // not a JSON array — fall through to line/block splitting
+  }
+
+  // Split on blank lines or dashed separators into blocks.
+  const blocks = trimmed
+    .split(/\n\s*\n|\n-{3,}\n/)
+    .map((b) => b.trim())
+    .filter(Boolean);
+
+  const entries: string[] = [];
+  for (const block of blocks) {
+    // A block that is itself valid JSON is one entry.
+    try {
+      JSON.parse(block);
+      entries.push(block);
+      continue;
+    } catch {
+      // otherwise treat each non-empty, non-comment line as one entry
+    }
+    for (const rawLine of block.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
+      entries.push(line);
+    }
+  }
+
+  // De-duplicate while preserving order.
+  return Array.from(new Set(entries));
+}
