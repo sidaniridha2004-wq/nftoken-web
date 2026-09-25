@@ -9,7 +9,7 @@ const MAX_ARCHIVE_BYTES = 4 * 1024 * 1024;
 
 type ExtractResponse = {
   count: number;
-  cookies: { source: string; cookie: string; label: string }[];
+  cookies: { source: string; cookie: string; label: string; country?: string }[];
 };
 
 /**

@@ -1,5 +1,6 @@
 import { unzipSync, strFromU8 } from "fflate";
 import { extractCookieDict, serializeCookieDict } from "./cookies";
+import { detectCountryLabel } from "./country";
 
 export type ExtractedCookie = {
   /** Path of the entry inside the archive. */
@@ -8,6 +9,8 @@ export type ExtractedCookie = {
   cookie: string;
   /** A friendly label (email if present, else the file name). */
   label: string;
+  /** Country of origin parsed from the file metadata, if present. */
+  country?: string;
 };
 
 const TEXT_RE = /\.(txt|json|text|log|csv)$/i;
@@ -36,7 +39,13 @@ function collect(
   if (!netflixId) return;
   if (seen.has(netflixId)) return;
   seen.add(netflixId);
-  out.push({ source, cookie: serializeCookieDict(dict), label: labelFor(source, text) });
+  const country = detectCountryLabel(text) ?? undefined;
+  out.push({
+    source,
+    cookie: serializeCookieDict(dict),
+    label: labelFor(source, text),
+    country,
+  });
 }
 
 export type ArchiveKind = "zip" | "rar";
