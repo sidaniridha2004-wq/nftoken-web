@@ -150,3 +150,13 @@ export function splitBulkCookies(text: string): string[] {
   // De-duplicate while preserving order.
   return Array.from(new Set(entries));
 }
+
+/**
+ * Rebuild a cookie header string from an extracted dict, preserving the raw
+ * (URL-encoded) values so it round-trips exactly like a pasted cookie header.
+ */
+export function serializeCookieDict(dict: Record<string, string>): string {
+  return COOKIE_KEYS.filter((key) => dict[key])
+    .map((key) => `${key}=${dict[key]}`)
+    .join("; ");
+}
