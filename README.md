@@ -1,73 +1,66 @@
-# nftoken web
+# nftoken-web
 
-A Vercel-ready website that generates a Netflix login URL (`https://netflix.com/?nftoken=...`) from an authenticated `NetflixId` cookie.
+A small web app that turns a Netflix session cookie into a one-tap login URL,
+checks whether cookies are still alive, and keeps a saved vault — all in your
+browser. Built with **Next.js 15 (App Router) + React 19 + TypeScript** and
+deployable to **Vercel with zero environment variables**.
 
-Ported from [abayxxx/nftoken-generator](https://github.com/abayxxx/nftoken-generator) (Python CLI + Flask) to **Next.js** so you can deploy it on Vercel in a few clicks.
+This is a web port of the Python/Flask project
+[`abayxxx/nftoken-generator`](https://github.com/abayxxx/nftoken-generator).
+
+## Features
+
+- **Generate** — paste a Netflix cookie and get a `https://netflix.com/?nftoken=…`
+  login URL plus its expiry. Copy or open it directly.
+- **Cookie checker** — every cookie is classified as **working**, **dead**
+  (no valid token), or **error** (upstream/network issue).
+- **Bulk import** — paste many cookies at once (one per line, blank-line /
+  dashed-separated blocks, or a JSON array of strings or export objects). They
+  are checked in parallel with a small concurrency pool so each request stays
+  well under Vercel Hobby's 10s function limit.
+- **Vault** — save cookies to a per-device vault, re-check one or all, clear the
+  dead ones, or clear everything. Working entries keep a copy/open shortcut.
+
+## Privacy
+
+Cookies are **live credentials**. They are used only to call Netflix's API and
+are **never logged or stored on the server**. The saved vault lives in your
+browser's `localStorage` only — it never leaves your device. Anyone with access
+to the browser can read it, so use **“clear all”** on a shared computer.
 
 ## How it works
 
-1. You paste a Netflix cookie (raw header, `cookies.txt`, or JSON).
-2. The site extracts `NetflixId`.
-3. A server-side API route requests `account → token → default` from the iOS FTL user API.
-4. You get a copyable / openable login URL and the token expiry time.
+The browser can't call Netflix's iOS FTL user API directly (CORS + forbidden
+headers), so the exchange happens in a server route:
 
-The browser cannot call Netflix directly (CORS blocks it, and browsers forbid setting `Cookie` / `x-netflix.*` headers from JavaScript). The request therefore runs in `/api/token`.
+- `POST /api/token` — `{ cookie }` → `{ login_url, expires, expiry_text }`.
+- `POST /api/check` — `{ cookie }` → `{ status, message?, login_url?, expires?,
+  expiry_text?, netflix_id_preview }`. Returns HTTP 200 for any classified
+  result (working/dead/error in the body).
 
-## Local development
+Only the `NetflixId` cookie value is required; `SecureNetflixId`, `nfvdid`, and
+`OptanonConsent` are recognized if present.
+
+## Run locally
 
 ```bash
 npm install
 npm run dev
+# open http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000).
+## Deploy to Vercel
 
-## Deploy on Vercel
+1. Push this repo to GitHub (already at
+   `github.com/sidaniridha2004-wq/nftoken-web`).
+2. Import it at [vercel.com/new](https://vercel.com/new).
+3. No environment variables are needed. Deploy.
 
-1. Go to [vercel.com/new](https://vercel.com/new) and import **nftoken-web**.
-2. Leave the defaults (Framework Preset: Next.js, Build Command: `next build`, Output: default).
-3. Click **Deploy**.
+> Vercel Hobby caps serverless functions at 10s. Bulk checking is orchestrated
+> client-side as many short single-cookie requests, so it stays within the
+> limit.
 
-No environment variables are required.
+## Disclaimer
 
-## API
-
-`POST /api/token` with `{ "cookie": "<your cookie in any supported format>" }` returns:
-
-```json
-{
-  "login_url": "https://netflix.com/?nftoken=...",
-  "expires": 1785600000,
-  "expiry_text": "2026-08-01 23:00:00"
-}
-```
-
-Errors return `{ "error": "..." }` with `400` (bad input) or `502` (upstream failure).
-
-Request bodies are capped at 64 KB. The cookie is processed in memory and never stored.
-
-## Accepted input formats
-
-- **Raw cookie header:** `NetflixId=...; SecureNetflixId=...; nfvdid=...`
-- **Netscape `cookies.txt`** export (tab-separated lines)
-- **JSON export**, as either:
-  - a list of `{ "name": "...", "value": "..." }` objects,
-  - an object with a `"cookies"` list, or
-  - a flat object like `{ "NetflixId": "..." }`
-
-Only `NetflixId` is strictly required.
-
-## Compatibility
-
-The generated link is a **web** login (`?nftoken=...`). It logs you into Netflix in a browser. It does **not** sign you into the native Netflix app.
-
-| Target | Works? | Notes |
-| --- | --- | --- |
-| Desktop browser | Yes | Sets a session cookie with a long declared lifespan. |
-| Mobile browser (Safari/Chrome) | Yes | Open the link **in the browser** — tapping it on a phone may deep-link into the Netflix app, which ignores the token. |
-| Netflix native app (iOS/Android) | No | The app uses its own auth and ignores web login links. |
-
-## Notes & disclaimer
-
-- Your `NetflixId` cookie is a live credential. Anyone using a hosted instance is sending it to that server for one request. Keep the deployment private if you do not want to operate a public credential relay.
-- For educational purposes and for use with your own account. Respect Netflix's Terms of Service.
+For use with **your own** Netflix account. You are responsible for how you use
+your own credentials.
