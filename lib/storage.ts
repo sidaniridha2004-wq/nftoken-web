@@ -7,6 +7,7 @@ export type SavedStatus = "unknown" | "working" | "invalid" | "error";
 export type SavedCookie = {
   id: string;
   label: string;
+  source?: string;
   raw: string;
   preview: string;
   status: SavedStatus;
@@ -49,11 +50,16 @@ export function makeId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-export function newSavedCookie(raw: string, label?: string): SavedCookie {
+export function newSavedCookie(
+  raw: string,
+  label?: string,
+  source?: string,
+): SavedCookie {
   const trimmed = raw.trim();
   return {
     id: makeId(),
     label: label?.trim() || "",
+    source: source?.trim() || undefined,
     raw: trimmed,
     preview: netflixIdPreview(trimmed),
     status: "unknown",

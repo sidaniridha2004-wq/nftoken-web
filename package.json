@@ -6,10 +6,13 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "lint": "next lint"
   },
   "dependencies": {
+    "fflate": "^0.8.2",
     "next": "^15.5.4",
+    "node-unrar-js": "^2.0.2",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"
   },
