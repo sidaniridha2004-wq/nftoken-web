@@ -4,7 +4,6 @@ import { extractCookieDict } from "@/lib/cookies";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 30;
 
 const MAX_COOKIE_CHARS = 64 * 1024;
 
