@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { ClientError, UpstreamError, fetchNftoken } from "@/lib/client";
 import { extractCookieDict } from "@/lib/cookies";
+import { fetchRealCountry } from "@/lib/country";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -47,10 +48,12 @@ export async function POST(request: Request) {
 
   try {
     const result = await fetchNftoken(cookieDict);
+    const country = await fetchRealCountry(rawCookie);
     return NextResponse.json({
       login_url: result.login_url,
       expires: result.expires,
       expiry_text: result.expiry_text,
+      country: country || undefined,
     });
   } catch (err) {
     if (err instanceof ClientError) {

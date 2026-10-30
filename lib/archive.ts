@@ -9,7 +9,7 @@ export type ExtractedCookie = {
   cookie: string;
   /** A friendly label (email if present, else the file name). */
   label: string;
-  /** Country of origin parsed from the file metadata, if present. */
+  /** Country of origin parsed from the file metadata or path, if present. */
   country?: string;
 };
 
@@ -39,7 +39,7 @@ function collect(
   if (!netflixId) return;
   if (seen.has(netflixId)) return;
   seen.add(netflixId);
-  const country = detectCountryLabel(text) ?? undefined;
+  const country = detectCountryLabel(text, source) ?? undefined;
   out.push({
     source,
     cookie: serializeCookieDict(dict),

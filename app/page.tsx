@@ -2,856 +2,830 @@
 
 import {
   ChangeEvent,
-  Fragment,
   FormEvent,
   useCallback,
   useEffect,
   useMemo,
   useState,
 } from "react";
-import { extractCookieDict, splitBulkCookies } from "@/lib/cookies";
+import { extractCookieDict } from "@/lib/cookies";
 import {
   SavedCookie,
-  SavedStatus,
   loadSaved,
   newSavedCookie,
   persistSaved,
 } from "@/lib/storage";
 
-type Tab = "generate" | "vault";
+type NavSection = "overview" | "generate" | "cookies" | "custom" | "vault";
 
-type CheckResponse = {
-  status: "working" | "invalid" | "error";
-  message?: string;
-  login_url?: string;
+type PublicPoolEntry = {
+  id: string;
+  label: string;
+  country?: string;
+  preview: string;
+  status: string;
+  loginUrl?: string;
   expires?: number | null;
-  expiry_text?: string;
-  netflix_id_preview: string;
+  expiryText?: string;
+  addedAt: number;
 };
 
-async function checkCookie(raw: string): Promise<CheckResponse> {
-  try {
-    const res = await fetch("/api/check", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cookie: raw }),
-    });
-    return (await res.json()) as CheckResponse;
-  } catch (err) {
-    return {
-      status: "error",
-      message: "Network error: " + (err instanceof Error ? err.message : String(err)),
-      netflix_id_preview: "—",
-    };
-  }
-}
-
-/** Run async work over items with limited concurrency. */
-async function pool<T>(
-  items: T[],
-  limit: number,
-  worker: (item: T, index: number) => Promise<void>,
-): Promise<void> {
-  let cursor = 0;
-  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (cursor < items.length) {
-      const index = cursor++;
-      await worker(items[index], index);
-    }
-  });
-  await Promise.all(runners);
-}
-
-function statusLabel(status: SavedStatus): string {
-  switch (status) {
-    case "working":
-      return "working";
-    case "invalid":
-      return "dead";
-    case "error":
-      return "error";
-    default:
-      return "unchecked";
-  }
-}
-
-function relativeTime(ts?: number): string {
-  if (!ts) return "never";
-  const diff = Date.now() - ts;
-  const min = Math.round(diff / 60000);
-  if (min < 1) return "just now";
-  if (min < 60) return `${min}m ago`;
-  const hr = Math.round(min / 60);
-  if (hr < 24) return `${hr}h ago`;
-  const day = Math.round(hr / 24);
-  return `${day}d ago`;
-}
-
 export default function Page() {
-  const [tab, setTab] = useState<Tab>("generate");
+  const [activeNav, setActiveNav] = useState<NavSection>("overview");
+  const [poolEntries, setPoolEntries] = useState<PublicPoolEntry[]>([]);
+  const [loadingPool, setLoadingPool] = useState(true);
 
-  return (
-    <main>
-      <header className="masthead">
-        <p className="eyebrow">netflix · session utility</p>
-        <h1>
-          <span className="caret">›</span> nftoken
-        </h1>
-        <p className="lede">
-          Turn a Netflix session cookie into a one-tap login URL, check whether
-          cookies are still alive, and keep a saved vault — all in your browser.
-        </p>
-      </header>
+  // Random generator states
+  const [randomEntry, setRandomEntry] = useState<PublicPoolEntry | null>(null);
+  const [randomGenerating, setRandomGenerating] = useState(false);
+  const [randomError, setRandomError] = useState<string | null>(null);
+  const [randomCopied, setRandomCopied] = useState(false);
 
-      <nav className="tabs" role="tablist">
-        <button
-          role="tab"
-          aria-selected={tab === "generate"}
-          className={tab === "generate" ? "tab active" : "tab"}
-          onClick={() => setTab("generate")}
-        >
-          Generate
-        </button>
-        <button
-          role="tab"
-          aria-selected={tab === "vault"}
-          className={tab === "vault" ? "tab active" : "tab"}
-          onClick={() => setTab("vault")}
-        >
-          Vault, import &amp; check
-        </button>
-      </nav>
+  // Pool country filter & search
+  const [selectedCountry, setSelectedCountry] = useState("all");
+  const [copiedId, setCopiedId] = useState<string | null>(null);
 
-      {tab === "generate" ? <GeneratePanel /> : <VaultPanel />}
-
-      <footer>
-        <span>v2.1.0</span>
-        <span className="sep">/</span>
-        <a
-          href="https://github.com/sidaniridha2004-wq/nftoken-web"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          github.com/sidaniridha2004-wq
-        </a>
-      </footer>
-    </main>
-  );
-}
-
-function GeneratePanel() {
-  const [cookie, setCookie] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<{
+  // Custom single cookie generator states
+  const [customCookie, setCustomCookie] = useState("");
+  const [customLoading, setCustomLoading] = useState(false);
+  const [customError, setCustomError] = useState<string | null>(null);
+  const [customResult, setCustomResult] = useState<{
     login_url: string;
     expiry_text: string;
+    country?: string;
   } | null>(null);
-  const [copied, setCopied] = useState(false);
-  const [saved, setSaved] = useState(false);
+  const [customCopied, setCustomCopied] = useState(false);
 
-  async function generate(event?: FormEvent) {
-    event?.preventDefault();
-    const value = cookie.trim();
-    if (!value) {
-      setError("Please paste your Netflix cookie.");
-      setResult(null);
-      return;
-    }
-    setLoading(true);
-    setError(null);
-    setCopied(false);
-    setSaved(false);
+  // Vault
+  const [vaultItems, setVaultItems] = useState<SavedCookie[]>([]);
+
+  const fetchPool = useCallback(async () => {
     try {
-      const res = await fetch("/api/token", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cookie: value }),
-      });
+      const res = await fetch("/api/pool");
+      if (res.ok) {
+        const data = await res.json();
+        setPoolEntries(data.entries ?? []);
+      }
+    } catch {
+      // silent
+    } finally {
+      setLoadingPool(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchPool();
+    setVaultItems(loadSaved());
+    const interval = setInterval(fetchPool, 30_000);
+    return () => clearInterval(interval);
+  }, [fetchPool]);
+
+  async function generateRandomLink() {
+    setRandomGenerating(true);
+    setRandomError(null);
+    setRandomCopied(false);
+    try {
+      const res = await fetch("/api/pool/random", { method: "POST" });
       const data = await res.json();
       if (!res.ok) {
-        setResult(null);
-        setError(data.error || "Something went wrong.");
+        setRandomError(data.error || "Could not generate a live link.");
         return;
       }
-      setResult(data);
+      setRandomEntry(data);
+      if (data.loginUrl) {
+        try {
+          await navigator.clipboard.writeText(data.loginUrl);
+          setRandomCopied(true);
+          setTimeout(() => setRandomCopied(false), 2000);
+        } catch {
+          /* clipboard blocked */
+        }
+      }
     } catch (err) {
-      setResult(null);
-      setError(
+      setRandomError(
         "Network error: " + (err instanceof Error ? err.message : String(err)),
       );
     } finally {
-      setLoading(false);
+      setRandomGenerating(false);
     }
   }
 
-  async function copyUrl() {
-    if (!result?.login_url) return;
+  async function copyToClipboard(text?: string, id?: string) {
+    if (!text) return;
     try {
-      await navigator.clipboard.writeText(result.login_url);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      await navigator.clipboard.writeText(text);
+      if (id) {
+        setCopiedId(id);
+        setTimeout(() => setCopiedId(null), 1500);
+      }
     } catch {
       /* clipboard blocked */
     }
   }
 
-  function saveToVault() {
-    const value = cookie.trim();
-    if (!value) return;
-    const items = loadSaved();
-    const entry = newSavedCookie(value);
-    entry.status = "working";
-    if (result) {
-      entry.loginUrl = result.login_url;
-      entry.expiryText = result.expiry_text;
-      entry.lastChecked = Date.now();
-    }
-    persistSaved([entry, ...items]);
-    setSaved(true);
-    setTimeout(() => setSaved(false), 1800);
-  }
-
-  return (
-    <section className="panel">
-      <form onSubmit={generate}>
-        <div className="field-head">
-          <label htmlFor="cookie">cookie</label>
-          <span className="hint">raw header · cookies.txt · json</span>
-        </div>
-        <textarea
-          id="cookie"
-          spellCheck={false}
-          placeholder="NetflixId=...; SecureNetflixId=...; nfvdid=..."
-          value={cookie}
-          onChange={(e) => setCookie(e.target.value)}
-          onKeyDown={(e) => {
-            if ((e.metaKey || e.ctrlKey) && e.key === "Enter") void generate();
-          }}
-        />
-        <div className="actions">
-          <button className="primary" type="submit" disabled={loading}>
-            {loading ? "Generating…" : "Generate login URL"}
-          </button>
-          <span className="status">only NetflixId is required</span>
-        </div>
-      </form>
-
-      {error ? <div className="error">{error}</div> : null}
-
-      {result ? (
-        <div className="result">
-          <div className="row">
-            <div className="k">login url</div>
-            <div className="url-row">
-              <span className="url-box">{result.login_url}</span>
-              <button className="chip" type="button" onClick={copyUrl}>
-                {copied ? "copied!" : "copy"}
-              </button>
-              <a
-                className="chip"
-                href={result.login_url}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                open
-              </a>
-            </div>
-          </div>
-          <div className="row">
-            <div className="k">expires</div>
-            <div className="v-mono">{result.expiry_text || "Unknown"}</div>
-          </div>
-          <div className="row">
-            <button className="chip solid" type="button" onClick={saveToVault}>
-              {saved ? "saved ✓" : "save to vault"}
-            </button>
-          </div>
-        </div>
-      ) : null}
-
-      <div className="note">
-        <span className="tag">note</span>
-        <span>
-          Your cookie is a live credential. It is used only to call Netflix and
-          is never logged or stored on the server. Saving keeps it in this
-          browser only. Use it with your own account.
-        </span>
-      </div>
-    </section>
-  );
-}
-
-function VaultPanel() {
-  const [items, setItems] = useState<SavedCookie[]>([]);
-  const [bulk, setBulk] = useState("");
-  const [importing, setImporting] = useState(false);
-  const [checkingAll, setCheckingAll] = useState(false);
-  const [archiveBusy, setArchiveBusy] = useState(false);
-  const [extracting, setExtracting] = useState(false);
-  const [summary, setSummary] = useState<string | null>(null);
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const [progress, setProgress] = useState<{ done: number; total: number } | null>(
-    null,
-  );
-  const [countryFilter, setCountryFilter] = useState<string>("all");
-
-  useEffect(() => {
-    setItems(loadSaved());
-  }, []);
-
-  const update = useCallback((next: SavedCookie[]) => {
-    setItems(next);
-    persistSaved(next);
-  }, []);
-
-  const counts = useMemo(() => {
-    const c = { working: 0, invalid: 0, error: 0, unknown: 0 };
-    for (const it of items) c[it.status]++;
-    return c;
-  }, [items]);
-
-  const countryCounts = useMemo(() => {
-    const m = new Map<string, number>();
-    for (const it of items) {
-      const key = it.country || "";
-      m.set(key, (m.get(key) || 0) + 1);
-    }
-    return m;
-  }, [items]);
-
-  const hasCountries = useMemo(
-    () => items.some((it) => it.country),
-    [items],
-  );
-
-  const countryOptions = useMemo(() => {
-    return [...countryCounts.entries()].sort((a, b) => {
-      if (a[0] === "") return 1;
-      if (b[0] === "") return -1;
-      return a[0].localeCompare(b[0]);
-    });
-  }, [countryCounts]);
-
-  const visibleItems = useMemo(() => {
-    const base =
-      countryFilter === "all"
-        ? items.slice()
-        : items.filter((it) => (it.country || "") === countryFilter);
-    if (!hasCountries) return base;
-    const order = new Map(countryOptions.map(([code], i) => [code, i]));
-    return base
-      .map((it, i) => ({ it, i }))
-      .sort((a, b) => {
-        const ca = order.get(a.it.country || "") ?? 0;
-        const cb = order.get(b.it.country || "") ?? 0;
-        if (ca !== cb) return ca - cb;
-        return a.i - b.i;
-      })
-      .map((x) => x.it);
-  }, [items, countryFilter, hasCountries, countryOptions]);
-
-  useEffect(() => {
-    if (countryFilter !== "all" && !countryCounts.has(countryFilter)) {
-      setCountryFilter("all");
-    }
-  }, [countryFilter, countryCounts]);
-
-  const patch = useCallback((id: string, changes: Partial<SavedCookie>) => {
-    setItems((prev) => {
-      const next = prev.map((it) => (it.id === id ? { ...it, ...changes } : it));
-      persistSaved(next);
-      return next;
-    });
-  }, []);
-
-  const toggleExpanded = useCallback((id: string) => {
-    setExpanded((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }, []);
-
-  const busy = importing || checkingAll || archiveBusy;
-
-  async function importBulk() {
-    const entries = splitBulkCookies(bulk);
-    if (entries.length === 0) return;
-    setImporting(true);
-    const created = entries.map((raw) => newSavedCookie(raw));
-    update([...created, ...items]);
-    setBulk("");
-
-    setProgress({ done: 0, total: created.length });
-    let done = 0;
-    await pool(created, 4, async (entry) => {
-      const res = await checkCookie(entry.raw);
-      patch(entry.id, {
-        status: res.status,
-        message: res.message,
-        loginUrl: res.login_url,
-        expires: res.expires ?? null,
-        expiryText: res.expiry_text,
-        preview:
-          res.netflix_id_preview && res.netflix_id_preview !== "—"
-            ? res.netflix_id_preview
-            : entry.preview,
-        lastChecked: Date.now(),
-      });
-      done++;
-      setProgress({ done, total: created.length });
-    });
-    setProgress(null);
-    setImporting(false);
-  }
-
-  async function importArchive(file: File) {
-    setSummary(null);
-    if (file.size > 4 * 1024 * 1024) {
-      setSummary("That archive is larger than 4 MB. Please split it into smaller files.");
+  async function handleCustomGenerate(e?: FormEvent) {
+    e?.preventDefault();
+    const val = customCookie.trim();
+    if (!val) {
+      setCustomError("Please paste a Netflix cookie.");
       return;
     }
-    setArchiveBusy(true);
-    setExtracting(true);
-    try {
-      const fd = new FormData();
-      fd.append("file", file);
-      const res = await fetch("/api/extract", { method: "POST", body: fd });
-      const data = await res.json();
-      setExtracting(false);
-      if (!res.ok) {
-        setSummary(data.error || "Could not read the archive.");
-        return;
-      }
-      const extracted = (data.cookies ?? []) as {
-        source: string;
-        cookie: string;
-        label: string;
-        country?: string;
-      }[];
-      if (extracted.length === 0) {
-        setSummary("No Netflix cookies found in that archive.");
-        return;
-      }
-
-      // Skip cookies already in the vault (matched by NetflixId).
-      const existing = new Set(
-        items.map((it) => extractCookieDict(it.raw)["NetflixId"]).filter(Boolean),
-      );
-      const fresh = extracted.filter((c) => {
-        const id = extractCookieDict(c.cookie)["NetflixId"];
-        return id && !existing.has(id);
-      });
-      const skipped = extracted.length - fresh.length;
-      if (fresh.length === 0) {
-        setSummary(`Extracted ${extracted.length} — all already in your vault.`);
-        return;
-      }
-
-      const created = fresh.map((c) => {
-        const entry = newSavedCookie(c.cookie, c.label, c.source);
-        entry.country = c.country;
-        return entry;
-      });
-      update([...created, ...items]);
-
-      setProgress({ done: 0, total: created.length });
-      let done = 0;
-      const results = new Map<string, SavedStatus>();
-      await pool(created, 6, async (entry) => {
-        const r = await checkCookie(entry.raw);
-        results.set(entry.id, r.status);
-        patch(entry.id, {
-          status: r.status,
-          message: r.message,
-          loginUrl: r.login_url,
-          expires: r.expires ?? null,
-          expiryText: r.expiry_text,
-          preview:
-            r.netflix_id_preview && r.netflix_id_preview !== "—"
-              ? r.netflix_id_preview
-              : entry.preview,
-          lastChecked: Date.now(),
-        });
-        done++;
-        setProgress({ done, total: created.length });
-      });
-
-      const working = [...results.values()].filter((s) => s === "working").length;
-      const dead = [...results.values()].filter((s) => s === "invalid").length;
-      const errored = [...results.values()].filter((s) => s === "error").length;
-
-      // Drop the dead ones we just added — keep working (and errors to retry).
-      const deadIds = new Set(
-        created.filter((c) => results.get(c.id) === "invalid").map((c) => c.id),
-      );
-      setItems((prev) => {
-        const next = prev.filter((it) => !deadIds.has(it.id));
-        persistSaved(next);
-        return next;
-      });
-
-      setSummary(
-        `Extracted ${extracted.length}` +
-          (skipped ? ` (${skipped} already saved)` : "") +
-          ` · ${working} working saved · ${dead} dead removed` +
-          (errored ? ` · ${errored} error (kept)` : ""),
-      );
-    } catch (err) {
-      setSummary(
-        "Upload failed: " + (err instanceof Error ? err.message : String(err)),
-      );
-    } finally {
-      setExtracting(false);
-      setProgress(null);
-      setArchiveBusy(false);
-    }
-  }
-
-  function onFile(e: ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    e.target.value = "";
-    if (file) void importArchive(file);
-  }
-
-  async function recheck(id: string) {
-    const item = items.find((it) => it.id === id);
-    if (!item) return;
-    patch(id, { message: "checking…" });
-    const res = await checkCookie(item.raw);
-    patch(id, {
-      status: res.status,
-      message: res.message,
-      loginUrl: res.login_url,
-      expires: res.expires ?? null,
-      expiryText: res.expiry_text,
-      lastChecked: Date.now(),
-    });
-  }
-
-  async function recheckAll() {
-    if (items.length === 0) return;
-    setCheckingAll(true);
-    setProgress({ done: 0, total: items.length });
-    let done = 0;
-    const snapshot = [...items];
-    await pool(snapshot, 6, async (item) => {
-      const res = await checkCookie(item.raw);
-      patch(item.id, {
-        status: res.status,
-        message: res.message,
-        loginUrl: res.login_url,
-        expires: res.expires ?? null,
-        expiryText: res.expiry_text,
-        lastChecked: Date.now(),
-      });
-      done++;
-      setProgress({ done, total: snapshot.length });
-    });
-    setProgress(null);
-    setCheckingAll(false);
-  }
-
-  /** (Re)generate a fresh login URL for a working cookie and reveal it. */
-  async function generate(id: string) {
-    const item = items.find((it) => it.id === id);
-    if (!item) return;
-    patch(id, { message: "generating…" });
+    setCustomLoading(true);
+    setCustomError(null);
     try {
       const res = await fetch("/api/token", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cookie: item.raw }),
+        body: JSON.stringify({ cookie: val }),
       });
       const data = await res.json();
       if (!res.ok) {
-        patch(id, { message: data.error || "Could not generate a URL." });
+        setCustomError(data.error || "Failed to generate link.");
+        setCustomResult(null);
         return;
       }
-      patch(id, {
-        status: "working",
-        loginUrl: data.login_url,
-        expiryText: data.expiry_text,
-        lastChecked: Date.now(),
-        message: undefined,
-      });
-      setExpanded((prev) => new Set(prev).add(id));
-      try {
-        await navigator.clipboard.writeText(data.login_url);
-      } catch {
-        /* clipboard blocked */
-      }
+      setCustomResult(data);
     } catch (err) {
-      patch(id, {
-        message: "Network error: " + (err instanceof Error ? err.message : String(err)),
-      });
+      setCustomError("Network error: " + (err instanceof Error ? err.message : String(err)));
+      setCustomResult(null);
+    } finally {
+      setCustomLoading(false);
     }
   }
 
-  function remove(id: string) {
-    update(items.filter((it) => it.id !== id));
-  }
-
-  function removeDead() {
-    update(items.filter((it) => it.status !== "invalid"));
-  }
-
-  function clearAll() {
-    if (!window.confirm("Remove all saved cookies from this browser?")) return;
-    update([]);
-  }
-
-  async function copy(text?: string) {
-    if (!text) return;
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      /* ignore */
+  const countries = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const e of poolEntries) {
+      const c = e.country || "Other";
+      counts.set(c, (counts.get(c) || 0) + 1);
     }
-  }
+    return [...counts.entries()].sort((a, b) => {
+      if (a[0] === "Other") return 1;
+      if (b[0] === "Other") return -1;
+      return a[0].localeCompare(b[0]);
+    });
+  }, [poolEntries]);
+
+  const filteredCookies = useMemo(() => {
+    if (selectedCountry === "all") return poolEntries;
+    return poolEntries.filter((e) => (e.country || "Other") === selectedCountry);
+  }, [poolEntries, selectedCountry]);
+
+  // Formatted current date for overview header (set on client to avoid hydration mismatch)
+  const [todayDate, setTodayDate] = useState("");
+  useEffect(() => {
+    setTodayDate(
+      new Date().toLocaleDateString("en-US", {
+        weekday: "long",
+        day: "numeric",
+        month: "long",
+      }).toUpperCase()
+    );
+  }, []);
 
   return (
-    <section className="panel">
-      <div className="field-head">
-        <label>import from archive</label>
-        <span className="hint">.zip or .rar of cookie files</span>
-      </div>
-      <div className="uploader">
-        <label className={busy ? "chip solid file-btn disabled" : "chip solid file-btn"}>
-          {archiveBusy
-            ? extracting
-              ? "Extracting…"
-              : "Checking…"
-            : "Choose .zip / .rar"}
-          <input
-            type="file"
-            accept=".zip,.rar,application/zip,application/x-rar-compressed,application/vnd.rar"
-            hidden
-            disabled={busy}
-            onChange={onFile}
-          />
-        </label>
-        <span className="status">
-          {archiveBusy && progress
-            ? `checked ${progress.done}/${progress.total}`
-            : "extract → validate → keep the working ones"}
-        </span>
-      </div>
-      {summary ? <div className="summary">{summary}</div> : null}
-
-      <hr className="rule" />
-
-      <div className="field-head">
-        <label htmlFor="bulk">or paste cookies</label>
-        <span className="hint">one per line · or a json array</span>
-      </div>
-      <textarea
-        id="bulk"
-        spellCheck={false}
-        placeholder={"NetflixId=...\nNetflixId=...\nNetflixId=..."}
-        value={bulk}
-        onChange={(e) => setBulk(e.target.value)}
-      />
-      <div className="actions">
-        <button
-          className="primary"
-          type="button"
-          onClick={importBulk}
-          disabled={busy || !bulk.trim()}
-        >
-          {importing ? "Importing…" : "Import & check"}
-        </button>
-        {importing && progress ? (
-          <span className="status">
-            checked {progress.done}/{progress.total}
-          </span>
-        ) : (
-          <span className="status">saved to this browser only</span>
-        )}
-      </div>
-
-      <hr className="rule" />
-
-      <div className="vault-head">
-        <div className="tallies">
-          <span className="pill working">{counts.working} working</span>
-          <span className="pill invalid">{counts.invalid} dead</span>
-          {counts.error ? (
-            <span className="pill error">{counts.error} error</span>
-          ) : null}
-          {counts.unknown ? (
-            <span className="pill unknown">{counts.unknown} unchecked</span>
-          ) : null}
+    <div className="app-container">
+      {/* ── Left Sidebar ────────────────────────────────────────── */}
+      <aside className="sidebar">
+        <div className="sidebar-logo">
+          <div className="logo-icon">
+            <svg viewBox="0 0 24 24">
+              <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />
+            </svg>
+          </div>
+          <span className="logo-text">nftoken</span>
         </div>
-        <div className="vault-tools">
-          {hasCountries ? (
-            <select
-              className="cf-select"
-              aria-label="Filter by country"
-              value={countryFilter}
-              onChange={(e) => setCountryFilter(e.target.value)}
-            >
-              <option value="all">All countries ({items.length})</option>
-              {countryOptions.map(([code, n]) => (
-                <option key={code || "__none__"} value={code}>
-                  {(code || "No country") + " (" + n + ")"}
-                </option>
-              ))}
-            </select>
-          ) : null}
-          <button
-            className="chip"
-            type="button"
-            onClick={recheckAll}
-            disabled={busy || items.length === 0}
-          >
-            {checkingAll ? "checking…" : "re-check all"}
-          </button>
-          <button
-            className="chip"
-            type="button"
-            onClick={removeDead}
-            disabled={busy || counts.invalid === 0}
-          >
-            clear dead
-          </button>
-          <button
-            className="chip danger"
-            type="button"
-            onClick={clearAll}
-            disabled={busy || items.length === 0}
-          >
-            clear all
-          </button>
-        </div>
-      </div>
 
-      {items.length === 0 ? (
-        <div className="empty">
-          No saved cookies yet. Upload a <strong>.zip/.rar</strong> or paste some
-          above — the working ones are kept with a <strong>Generate</strong>
-          button.
+        <nav className="sidebar-nav">
+          <div>
+            <div className="nav-section-title">PANEL</div>
+            <ul className="nav-list">
+              <li>
+                <button
+                  type="button"
+                  className={`nav-item ${activeNav === "overview" ? "active" : ""}`}
+                  onClick={() => setActiveNav("overview")}
+                >
+                  <span className="nav-icon">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path>
+                      <polyline points="9 22 9 12 15 12 15 22"></polyline>
+                    </svg>
+                  </span>
+                  Overview
+                </button>
+              </li>
+              <li>
+                <button
+                  type="button"
+                  className={`nav-item ${activeNav === "generate" ? "active" : ""}`}
+                  onClick={() => setActiveNav("generate")}
+                >
+                  <span className="nav-icon">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+                      <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+                    </svg>
+                  </span>
+                  Generate Link
+                </button>
+              </li>
+              <li>
+                <button
+                  type="button"
+                  className={`nav-item ${activeNav === "cookies" ? "active" : ""}`}
+                  onClick={() => setActiveNav("cookies")}
+                >
+                  <span className="nav-icon">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <circle cx="12" cy="12" r="10"></circle>
+                      <path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"></path>
+                      <path d="M2 12h20"></path>
+                    </svg>
+                  </span>
+                  Cookies Pool
+                </button>
+              </li>
+            </ul>
+          </div>
+
+          <div>
+            <div className="nav-section-title">TOOLS</div>
+            <ul className="nav-list">
+              <li>
+                <button
+                  type="button"
+                  className={`nav-item ${activeNav === "custom" ? "active" : ""}`}
+                  onClick={() => setActiveNav("custom")}
+                >
+                  <span className="nav-icon">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <polyline points="16 18 22 12 16 6"></polyline>
+                      <polyline points="8 6 2 12 8 18"></polyline>
+                    </svg>
+                  </span>
+                  Custom Cookie
+                </button>
+              </li>
+              <li>
+                <button
+                  type="button"
+                  className={`nav-item ${activeNav === "vault" ? "active" : ""}`}
+                  onClick={() => setActiveNav("vault")}
+                >
+                  <span className="nav-icon">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                      <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                    </svg>
+                  </span>
+                  Session Vault
+                </button>
+              </li>
+            </ul>
+          </div>
+        </nav>
+
+        <div className="sidebar-bottom">
+          <div className="status-badge">
+            <span className="pulse-dot"></span>
+            <span>nftoken • Live &amp; Ready</span>
+          </div>
         </div>
-      ) : (
-        <ul className="cookie-list">
-          {visibleItems.map((it, idx) => {
-            const groupKey = it.country || "";
-            const prevKey =
-              idx > 0 ? visibleItems[idx - 1].country || "" : null;
-            const showHeader = hasCountries && groupKey !== prevKey;
-            return (
-              <Fragment key={it.id}>
-                {showHeader ? (
-                  <li className="cookie-group">
-                    <span className="cg-name">{it.country || "No country"}</span>
-                    <span className="cg-count">
-                      {countryCounts.get(groupKey)}
-                    </span>
-                  </li>
-                ) : null}
-                <li className="cookie-item">
-              <div className="ci-main">
-                <span className={`dot ${it.status}`} aria-hidden />
-                <div className="ci-text">
-                  <div className="ci-top">
-                    <span className="ci-id">
-                      {it.label || `NetflixId ${it.preview}`}
-                    </span>
-                    {it.country ? (
-                      <span className="ci-country">{it.country}</span>
-                    ) : null}
-                    <span className={`pill ${it.status}`}>
-                      {statusLabel(it.status)}
-                    </span>
+      </aside>
+
+      {/* ── Main Content Area ───────────────────────────────────── */}
+      <main className="main-content">
+        <header className="topbar">
+          <div className="breadcrumb">
+            Panel / <span>{activeNav === "overview" ? "Overview" : activeNav === "generate" ? "Generate Link" : activeNav === "cookies" ? "Cookies" : activeNav === "custom" ? "Custom Cookie" : "Vault"}</span>
+          </div>
+          <div className="topbar-actions">
+            <button className="theme-btn" aria-label="Toggle theme" title="System Theme">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="5"></circle>
+                <line x1="12" y1="1" x2="12" y2="3"></line>
+                <line x1="12" y1="21" x2="12" y2="23"></line>
+                <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+                <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+                <line x1="1" y1="12" x2="3" y2="12"></line>
+                <line x1="21" y1="12" x2="23" y2="12"></line>
+                <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+                <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+              </svg>
+            </button>
+          </div>
+        </header>
+
+        <div className="page-body">
+          {/* ────────────────────────────────────────────────────────── */}
+          {/* VIEW 1: OVERVIEW (RESUMEN)                                 */}
+          {/* ────────────────────────────────────────────────────────── */}
+          {activeNav === "overview" && (
+            <div>
+              <div className="page-category">{todayDate}</div>
+              <div className="overview-header">
+                <div>
+                  <h1 className="page-title">
+                    Welcome to <span className="accent-text">nftoken</span>
+                  </h1>
+                  <p className="page-desc" style={{ marginBottom: 0 }}>
+                    This is your panel. Generate auto-login links, explore the live pool, and access accounts instantly.
+                  </p>
+                </div>
+                <div className="overview-actions">
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    onClick={() => setActiveNav("cookies")}
+                  >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                      <circle cx="12" cy="12" r="3"></circle>
+                    </svg>
+                    View pool
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-primary"
+                    onClick={() => setActiveNav("generate")}
+                  >
+                    <span>+</span> Generate link
+                  </button>
+                </div>
+              </div>
+
+              {/* 4 Stat Cards */}
+              <div className="stat-grid">
+                <div className="stat-card">
+                  <div className="stat-card-head">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <circle cx="12" cy="12" r="10"></circle>
+                      <path d="M12 6v6l4 2"></path>
+                    </svg>
+                    Available Cookies
                   </div>
-                  <div className="ci-sub">
-                    {it.label ? (
-                      <span className="ci-dim">NetflixId {it.preview} · </span>
-                    ) : null}
-                    {it.status === "working" && it.expiryText
-                      ? `expires ${it.expiryText}`
-                      : it.message || "—"}
-                    <span className="ci-dim">
-                      {" · checked "}
-                      {relativeTime(it.lastChecked)}
-                    </span>
+                  <div className="stat-card-value">{loadingPool ? "…" : poolEntries.length}</div>
+                  <div className="stat-card-foot">verified active in pool</div>
+                </div>
+
+                <div className="stat-card">
+                  <div className="stat-card-head">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+                      <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+                    </svg>
+                    Auto-Login
                   </div>
-                  {expanded.has(it.id) && it.loginUrl ? (
-                    <div className="ci-url">
-                      <span className="url-box">{it.loginUrl}</span>
-                      <button
-                        className="chip"
-                        type="button"
-                        onClick={() => copy(it.loginUrl)}
-                      >
-                        copy
-                      </button>
+                  <div className="stat-card-value">1-Tap</div>
+                  <div className="stat-card-foot">ready for instant launch</div>
+                </div>
+
+                <div className="stat-card">
+                  <div className="stat-card-head">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <circle cx="12" cy="12" r="10"></circle>
+                      <path d="M2 12h20"></path>
+                    </svg>
+                    Countries
+                  </div>
+                  <div className="stat-card-value">{countries.length}</div>
+                  <div className="stat-card-foot">global coverage</div>
+                </div>
+
+                <div className="stat-card">
+                  <div className="stat-card-head">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
+                      <polyline points="22 4 12 14.01 9 11.01"></polyline>
+                    </svg>
+                    Pool Status
+                  </div>
+                  <div className="stat-card-value" style={{ color: "var(--ok)" }}>ONLINE</div>
+                  <div className="stat-card-foot">100% pre-checked &amp; alive</div>
+                </div>
+              </div>
+
+              {/* Two Column Layout */}
+              <div className="dashboard-split">
+                {/* Left Card: Pool Health */}
+                <div className="dash-box">
+                  <div className="dash-box-head">
+                    <div className="dash-box-label">SECURITY &amp; STATUS</div>
+                    <div className="dash-box-title">Pool Verification</div>
+                  </div>
+                  <div className="health-circles-row">
+                    <div className="circle-item">
+                      <div className="circle-ring green">100%</div>
+                      <div>
+                        <div className="circle-label-main">Cookies Tested</div>
+                        <div className="circle-label-sub">{poolEntries.length} verified</div>
+                      </div>
+                    </div>
+                    <div className="circle-item">
+                      <div className="circle-ring">100%</div>
+                      <div>
+                        <div className="circle-label-main">Instant Tokens</div>
+                        <div className="circle-label-sub">No pass needed</div>
+                      </div>
+                    </div>
+                  </div>
+                  <p style={{ fontSize: "0.84rem", color: "var(--ink-secondary)", lineHeight: 1.5, marginTop: "8px" }}>
+                    Every session is validated directly against Netflix authentication APIs before being published. No expired or dead cookies are shown.
+                  </p>
+                </div>
+
+                {/* Right Card: Quick Actions */}
+                <div className="dash-box">
+                  <div className="dash-box-head">
+                    <div className="dash-box-label">SHORTCUTS</div>
+                    <div className="dash-box-title">Quick Actions</div>
+                  </div>
+                  <div className="actions-grid">
+                    <div className="action-tile" onClick={() => setActiveNav("generate")}>
+                      <div className="action-tile-icon">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+                        </svg>
+                      </div>
+                      <div className="action-tile-title">Generate link</div>
+                      <div className="action-tile-desc">One-click auto login</div>
+                    </div>
+
+                    <div className="action-tile" onClick={() => setActiveNav("cookies")}>
+                      <div className="action-tile-icon">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <circle cx="12" cy="12" r="10"></circle>
+                          <path d="M2 12h20"></path>
+                        </svg>
+                      </div>
+                      <div className="action-tile-title">Cookie pool</div>
+                      <div className="action-tile-desc">Explore &amp; unlock</div>
+                    </div>
+
+                    <div className="action-tile" onClick={() => setActiveNav("custom")}>
+                      <div className="action-tile-icon">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <polyline points="16 18 22 12 16 6"></polyline>
+                          <polyline points="8 6 2 12 8 18"></polyline>
+                        </svg>
+                      </div>
+                      <div className="action-tile-title">Custom cookie</div>
+                      <div className="action-tile-desc">Test your own token</div>
+                    </div>
+
+                    <div className="action-tile" onClick={() => setActiveNav("vault")}>
+                      <div className="action-tile-icon">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                          <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                        </svg>
+                      </div>
+                      <div className="action-tile-title">Session vault</div>
+                      <div className="action-tile-desc">Saved on this device</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ────────────────────────────────────────────────────────── */}
+          {/* VIEW 2: GENERATE LINK (AUTO-LOGIN)                        */}
+          {/* ────────────────────────────────────────────────────────── */}
+          {activeNav === "generate" && (
+            <div>
+              <div className="page-category">AUTO-LOGIN</div>
+              <h1 className="page-title">Generate Link</h1>
+              <p className="page-desc">
+                Create a link that opens Netflix with the session already logged in. No email or password needed.
+              </p>
+
+              <div className="feature-card">
+                <div className="feature-card-tag">LINK</div>
+                <div className="feature-card-title">Your auto-login link</div>
+                <p className="feature-card-desc">
+                  Click the button below and we will prepare a verified account from the pool for you. The link opens Netflix directly with session active.
+                </p>
+
+                <button
+                  type="button"
+                  className="btn-big-generate"
+                  onClick={generateRandomLink}
+                  disabled={randomGenerating || (poolEntries.length === 0 && !loadingPool)}
+                >
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+                    <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+                  </svg>
+                  {randomGenerating ? "Preparing Verified Live Session…" : "Generate auto-login link"}
+                </button>
+
+                {randomError && <div className="error-banner">{randomError}</div>}
+
+                {randomEntry && randomEntry.loginUrl && (
+                  <div className="result-box">
+                    <div className="result-header">
+                      <div className="result-title">
+                        <span>{randomEntry.country || "🌐 Global Account"}</span>
+                        <span className="result-badge">● Active &amp; Ready</span>
+                      </div>
+                      <span style={{ fontSize: "0.82rem", color: "var(--ink-secondary)" }}>
+                        {randomEntry.expiryText ? `Expires: ${randomEntry.expiryText}` : ""}
+                      </span>
+                    </div>
+
+                    <div className="result-meta">
+                      {randomEntry.label ? `${randomEntry.label} · ` : ""}
+                      NetflixId {randomEntry.preview}
+                      {randomCopied ? " · (Copied to clipboard!)" : ""}
+                    </div>
+
+                    <div className="result-actions">
                       <a
-                        className="chip"
-                        href={it.loginUrl}
+                        className="btn-launch"
+                        href={randomEntry.loginUrl}
                         target="_blank"
                         rel="noopener noreferrer"
                       >
-                        open
+                        🚀 Open Netflix (1-Tap Login)
                       </a>
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        onClick={() => copyToClipboard(randomEntry.loginUrl, "random")}
+                      >
+                        {copiedId === "random" || randomCopied ? "copied ✓" : "copy link"}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        onClick={generateRandomLink}
+                        disabled={randomGenerating}
+                      >
+                        🎲 Pick another
+                      </button>
                     </div>
-                  ) : null}
+                  </div>
+                )}
+              </div>
+
+              {poolEntries.length === 0 && !loadingPool && (
+                <div className="empty-state">
+                  <h3>No accounts in the pool yet</h3>
+                  <p>All accounts are prepared and verified by the system. Please check back shortly.</p>
+                  <button type="button" className="btn-secondary" onClick={() => fetchPool()}>
+                    Refresh
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ────────────────────────────────────────────────────────── */}
+          {/* VIEW 3: COOKIES POOL                                      */}
+          {/* ────────────────────────────────────────────────────────── */}
+          {activeNav === "cookies" && (
+            <div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 12 }}>
+                <div>
+                  <div className="page-category">POOL</div>
+                  <h1 className="page-title">Available Cookies</h1>
+                  <p className="page-desc">
+                    Explore the pool by country and launch the account you want.
+                  </p>
+                </div>
+                <div className="status-badge" style={{ marginTop: "10px" }}>
+                  Active Pool: <strong>{poolEntries.length} working</strong>
                 </div>
               </div>
-              <div className="ci-actions">
-                {it.status === "working" ? (
-                  <button
-                    className="chip solid"
-                    type="button"
-                    onClick={() => generate(it.id)}
-                    disabled={busy}
-                  >
-                    generate
-                  </button>
-                ) : null}
-                {it.status === "working" && it.loginUrl ? (
-                  <button
-                    className="chip"
-                    type="button"
-                    onClick={() => toggleExpanded(it.id)}
-                  >
-                    {expanded.has(it.id) ? "hide" : "url"}
-                  </button>
-                ) : null}
-                <button
-                  className="chip"
-                  type="button"
-                  onClick={() => recheck(it.id)}
-                  disabled={busy}
-                >
-                  re-check
-                </button>
-                <button
-                  className="chip danger"
-                  type="button"
-                  onClick={() => remove(it.id)}
-                >
-                  delete
-                </button>
-              </div>
-                </li>
-              </Fragment>
-            );
-          })}
-        </ul>
-      )}
 
-      <div className="note">
-        <span className="tag">privacy</span>
-        <span>
-          Archives are extracted and checked on the server but never stored or
-          logged. Saved cookies live in this browser’s local storage — not on the
-          server. Anyone with access to this device can read them. Use “clear
-          all” on a shared computer.
-        </span>
-      </div>
-    </section>
+              {/* Filter Card */}
+              <div className="feature-card" style={{ padding: "20px" }}>
+                <div className="feature-card-tag">FILTER</div>
+                <div style={{ fontSize: "1.05rem", fontWeight: 700, marginBottom: "4px" }}>
+                  Select country
+                </div>
+                <p style={{ fontSize: "0.85rem", color: "var(--ink-secondary)", margin: 0 }}>
+                  Click a country tag to filter accounts. Every cookie is pre-checked and verified live.
+                </p>
+
+                <div className="filter-pills-row">
+                  <button
+                    type="button"
+                    className={`filter-pill ${selectedCountry === "all" ? "active" : ""}`}
+                    onClick={() => setSelectedCountry("all")}
+                  >
+                    All ({poolEntries.length})
+                  </button>
+                  {countries.map(([c, count]) => (
+                    <button
+                      key={c}
+                      type="button"
+                      className={`filter-pill ${selectedCountry === c ? "active" : ""}`}
+                      onClick={() => setSelectedCountry(c)}
+                    >
+                      {c} ({count})
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Cookies Grid */}
+              {loadingPool ? (
+                <div className="empty-state">Loading verified cookies…</div>
+              ) : filteredCookies.length === 0 ? (
+                <div className="empty-state">
+                  <h3>No cookies available right now</h3>
+                  <p>All active accounts are verified live. Check back shortly.</p>
+                  <button type="button" className="btn-secondary" onClick={() => fetchPool()}>
+                    Refresh
+                  </button>
+                </div>
+              ) : (
+                <div className="cookie-cards-grid">
+                  {filteredCookies.map((c) => (
+                    <div key={c.id} className="cookie-dash-card">
+                      <div>
+                        <div className="cdc-top">
+                          <span className="cdc-country">{c.country || "🌐 Global"}</span>
+                          <span className="result-badge">● Active</span>
+                        </div>
+                        <div className="cdc-mid">
+                          <div className="cdc-label">{c.label || `NetflixId ${c.preview}`}</div>
+                          <div className="cdc-exp">{c.expiryText ? `Expires: ${c.expiryText}` : "Verified session"}</div>
+                        </div>
+                      </div>
+                      <div className="cdc-actions">
+                        {c.loginUrl && (
+                          <>
+                            <a
+                              className="btn-launch"
+                              href={c.loginUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                            >
+                              🚀 Open
+                            </a>
+                            <button
+                              type="button"
+                              className="btn-secondary"
+                              onClick={() => copyToClipboard(c.loginUrl, c.id)}
+                            >
+                              {copiedId === c.id ? "copied ✓" : "copy"}
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ────────────────────────────────────────────────────────── */}
+          {/* VIEW 4: CUSTOM COOKIE GENERATOR                           */}
+          {/* ────────────────────────────────────────────────────────── */}
+          {activeNav === "custom" && (
+            <div>
+              <div className="page-category">CUSTOM</div>
+              <h1 className="page-title">Custom Cookie</h1>
+              <p className="page-desc">
+                Paste any Netflix cookie string to test validity and generate your personal 1-tap login link.
+              </p>
+
+              <div className="feature-card">
+                <form onSubmit={handleCustomGenerate} className="custom-form">
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.85rem", color: "var(--ink-secondary)" }}>
+                    <span>Cookie Header, JSON, or cookies.txt</span>
+                    <span>Only NetflixId required</span>
+                  </div>
+                  <textarea
+                    className="custom-textarea"
+                    placeholder="NetflixId=...; SecureNetflixId=..."
+                    value={customCookie}
+                    onChange={(e) => setCustomCookie(e.target.value)}
+                  />
+                  <div style={{ display: "flex", gap: "10px" }}>
+                    <button
+                      type="submit"
+                      className="btn-primary"
+                      disabled={customLoading || !customCookie.trim()}
+                    >
+                      {customLoading ? "Generating…" : "Generate login URL"}
+                    </button>
+                  </div>
+                </form>
+
+                {customError && <div className="error-banner">{customError}</div>}
+
+                {customResult && (
+                  <div className="result-box">
+                    <div className="result-header">
+                      <div className="result-title">
+                        <span>{customResult.country || "🌐 Verified Account"}</span>
+                        <span className="result-badge">● Active</span>
+                      </div>
+                    </div>
+                    <div className="result-meta">
+                      Expires: {customResult.expiry_text || "Unknown"}
+                    </div>
+                    <div className="result-actions">
+                      <a
+                        className="btn-launch"
+                        href={customResult.login_url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        🚀 Open Netflix
+                      </a>
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        onClick={() => {
+                          copyToClipboard(customResult.login_url);
+                          setCustomCopied(true);
+                          setTimeout(() => setCustomCopied(false), 1500);
+                        }}
+                      >
+                        {customCopied ? "copied ✓" : "copy link"}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* ────────────────────────────────────────────────────────── */}
+          {/* VIEW 5: SESSION VAULT                                     */}
+          {/* ────────────────────────────────────────────────────────── */}
+          {activeNav === "vault" && (
+            <div>
+              <div className="page-category">VAULT</div>
+              <h1 className="page-title">Session Vault</h1>
+              <p className="page-desc">
+                Cookies stored in this browser only. Everything stays in your local storage.
+              </p>
+
+              {vaultItems.length === 0 ? (
+                <div className="empty-state">
+                  <h3>Your vault is empty</h3>
+                  <p>Cookies generated or saved in this browser will appear here.</p>
+                  <button
+                    type="button"
+                    className="btn-primary"
+                    onClick={() => setActiveNav("cookies")}
+                  >
+                    Explore Pool
+                  </button>
+                </div>
+              ) : (
+                <div className="cookie-cards-grid">
+                  {vaultItems.map((item) => (
+                    <div key={item.id} className="cookie-dash-card">
+                      <div>
+                        <div className="cdc-top">
+                          <span className="cdc-country">{item.country || "🌐 Session"}</span>
+                          <span className="result-badge">● {item.status}</span>
+                        </div>
+                        <div className="cdc-mid">
+                          <div className="cdc-label">{item.label || item.preview}</div>
+                          <div className="cdc-exp">{item.expiryText ? `Expires: ${item.expiryText}` : "Saved local"}</div>
+                        </div>
+                      </div>
+                      <div className="cdc-actions">
+                        {item.loginUrl && (
+                          <a
+                            className="btn-launch"
+                            href={item.loginUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                          >
+                            🚀 Open
+                          </a>
+                        )}
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          onClick={() => {
+                            const next = vaultItems.filter((v) => v.id !== item.id);
+                            setVaultItems(next);
+                            persistSaved(next);
+                          }}
+                        >
+                          delete
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </main>
+    </div>
   );
 }

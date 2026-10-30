@@ -19,8 +19,10 @@
 .env*.local
 .env
 
-# credentials — never commit
+# credentials & pool data — never commit
 input.txt
+data/
+*.tsbuildinfo
 
 # debug / os / editor
 npm-debug.log*

@@ -1,3 +1,5 @@
+import { extractCookieDict } from "./cookies";
+
 // Detects the country a Netflix cookie dump came from, using the metadata that
 // exported .txt files commonly include (e.g. a "Country: US" header line, or a
 // geolocation hint embedded in the OptanonConsent cookie). This is pure string
@@ -284,7 +286,7 @@ const ALIASES: Record<string, string> = {
   uae: "AE",
   "united arab emirates": "AE",
   "hong kong sar": "HK",
-  "macau": "MO",
+  macau: "MO",
   "macao sar": "MO",
   "ivory coast": "CI",
   turkey: "TR",
@@ -304,7 +306,7 @@ const ALIASES: Record<string, string> = {
   "tanzania united republic of": "TZ",
   "state of palestine": "PS",
   "palestinian territory": "PS",
-  "vatican": "VA",
+  vatican: "VA",
   "holy see": "VA",
   "east timor": "TL",
   "congo kinshasa": "CD",
@@ -375,9 +377,7 @@ export function fromName(raw: string): DetectedCountry | null {
 }
 
 /**
- * Interpret a single metadata value into a country. Handles a bare 2-letter
- * code, a full name, a name with a trailing "(US)" code, or a leading code such
- * as "US - United States". Only the first pipe/semicolon segment is considered.
+ * Interpret a single metadata value into a country.
  */
 export function interpret(rawValue: string): DetectedCountry | null {
   let value = rawValue.trim();
@@ -439,19 +439,33 @@ const COUNTRY_LABELS = new Set([
 ]);
 
 /**
- * Scan cookie-dump text for the country of origin.
- *
- * Precedence:
- *   1. An explicit metadata line such as "Country: US".
- *   2. Netflix's countryOfSignup value if present inline.
- *   3. A geolocation=CC hint inside the OptanonConsent cookie.
+ * Scan cookie-dump text and/or file source path for the country of origin.
  */
-export function detectCountry(text: string): DetectedCountry | null {
+export function detectCountry(text?: string, source?: string): DetectedCountry | null {
+  // 1) Explicit bracketed ISO country code in filename or source path (e.g. "...[IN]...", "...[PT]...")
+  if (source) {
+    const bracket = source.match(/\[([A-Za-z]{2})\]/);
+    if (bracket) {
+      const found = fromCode(bracket[1]);
+      if (found) return found;
+    }
+    const under = source.match(/[_\-\s]([A-Za-z]{2})[._\-\s]/);
+    if (under) {
+      const found = fromCode(under[1]);
+      if (found) return found;
+    }
+  }
+
   if (!text) return null;
 
-  // 1) Explicit metadata lines: "Key: Value", "Key = Value", "Key | Value",
-  //    or "Key - Value" (the dash form requires surrounding spaces so that
-  //    hyphenated names such as "Guinea-Bissau" are never split).
+  // 2) Explicit bracketed code in text comments / header (e.g. "[IN]")
+  const textBracket = text.slice(0, 500).match(/\[([A-Za-z]{2})\]/);
+  if (textBracket) {
+    const found = fromCode(textBracket[1]);
+    if (found) return found;
+  }
+
+  // 3) Explicit metadata lines: "Key: Value", "Key = Value", "Key | Value"
   for (const line of text.split(/\r?\n/)) {
     const m =
       line.match(/^\s*([A-Za-z][A-Za-z _-]*?)\s*[:=|]\s*(.+?)\s*$/) ||
@@ -463,19 +477,23 @@ export function detectCountry(text: string): DetectedCountry | null {
     if (found) return found;
   }
 
-  // 2) Netflix countryOfSignup (appears in some JSON / header exports).
+  // 4) Netflix countryOfSignup (appears in some JSON / header exports).
   const signup = text.match(/countryOfSignup["'=:\s]+([A-Za-z]{2})\b/i);
   if (signup) {
     const found = fromCode(signup[1]);
     if (found) return found;
   }
 
-  // 3) OptanonConsent geolocation hint, e.g. "...geolocation=CA;...".
+  // 5) OptanonConsent geolocation hint, e.g. "...geolocation=CA;...".
   const geo = text.match(/geolocation=([A-Za-z]{2})\b/i);
   if (geo) {
     const found = fromCode(geo[1]);
     if (found) return found;
   }
+
+  // 6) OptanonConsent date / timezone hint, e.g. "India+Standard+Time"
+  if (text.includes("India+Standard+Time")) return fromCode("IN");
+  if (text.includes("Brasilia")) return fromCode("BR");
 
   return null;
 }
@@ -486,7 +504,116 @@ export function toDisplay(country: DetectedCountry): string {
 }
 
 /** Convenience: detect and format in one call. Returns null if not found. */
-export function detectCountryLabel(text: string): string | null {
-  const country = detectCountry(text);
+export function detectCountryLabel(text?: string, source?: string): string | null {
+  const country = detectCountry(text, source);
   return country ? toDisplay(country) : null;
+}
+
+/**
+ * Live-fetch the REAL country of a Netflix account by querying Netflix directly
+ * using the provided session cookie.
+ */
+export async function fetchRealCountry(
+  cookieRaw: string,
+  source?: string,
+  loginUrl?: string,
+): Promise<string | null> {
+  const local = detectCountryLabel(cookieRaw, source);
+  if (local) return local;
+
+  if (loginUrl) {
+    const viaUrl = await fetchCountryViaLoginUrl(loginUrl);
+    if (viaUrl) return viaUrl;
+  }
+
+  try {
+    const dict = extractCookieDict(cookieRaw);
+    const netflixId = dict["NetflixId"];
+    if (!netflixId) return null;
+
+    const cookieHeader = Object.entries(dict)
+      .map(([k, v]) => `${k}=${v}`)
+      .join("; ");
+
+    const res = await fetch("https://www.netflix.com/YourAccount", {
+      method: "GET",
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Accept":
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        Cookie: cookieHeader,
+      },
+      redirect: "follow",
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    const setCookie = res.headers.get("set-cookie") || "";
+    const geoMatch = setCookie.match(/geolocation=([A-Za-z]{2})\b/i);
+    if (geoMatch) {
+      const c = fromCode(geoMatch[1]);
+      if (c) return toDisplay(c);
+    }
+
+    if (res.ok) {
+      const html = await res.text();
+      const match =
+        html.match(/"countryOfSignup"\s*:\s*"([A-Za-z]{2})"/i) ||
+        html.match(/"country"\s*:\s*"([A-Za-z]{2})"/i) ||
+        html.match(/"currentCountry"\s*:\s*"([A-Za-z]{2})"/i) ||
+        html.match(/"billingCountry"\s*:\s*"([A-Za-z]{2})"/i) ||
+        html.match(/countryOfSignup=([A-Za-z]{2})\b/i);
+
+      if (match) {
+        const c = fromCode(match[1]);
+        if (c) return toDisplay(c);
+      }
+    }
+  } catch {
+    // If request fails
+  }
+
+  return null;
+}
+
+
+/**
+ * Live-fetch the REAL country of a Netflix account by exchanging the live token
+ * login URL and reading the authenticated context from /YourAccount.
+ */
+export async function fetchCountryViaLoginUrl(loginUrl?: string): Promise<string | null> {
+  if (!loginUrl) return null;
+  const url = loginUrl.replace("https://netflix.com/", "https://www.netflix.com/");
+  try {
+    const r1 = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(8000) });
+    const rawCookies = r1.headers.getSetCookie();
+    if (!rawCookies || rawCookies.length === 0) return null;
+    const cookieHeader = rawCookies.map((c) => c.split(";")[0]).join("; ");
+
+    const r2 = await fetch("https://www.netflix.com/YourAccount", {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        Cookie: cookieHeader,
+      },
+      redirect: "follow",
+      signal: AbortSignal.timeout(8000),
+    });
+
+    const html = await r2.text();
+    const m =
+      html.match(/"countryOfSignup"\s*:\s*"([A-Za-z]{2})"/i) ||
+      html.match(/"currentCountry"\s*:\s*"([A-Za-z]{2})"/i) ||
+      html.match(/"billingCountry"\s*:\s*"([A-Za-z]{2})"/i);
+
+    if (m && m[1]) {
+      const code = m[1].toUpperCase();
+      const country = fromCode(code);
+      if (country) return toDisplay(country);
+    }
+  } catch {
+    // If request fails or times out
+  }
+  return null;
 }

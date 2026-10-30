@@ -1,0 +1,16 @@
+[build]
+  command = "npm run build"
+  publish = ".next"
+
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
+
+[functions]
+  node_bundler = "esbuild"
+  included_files = [
+    "node_modules/node-unrar-js/**/*.wasm",
+    "data/**/*.json"
+  ]
+
+[build.environment]
+  NODE_VERSION = "20"
