@@ -1,14 +1,14 @@
 /**
  * Admin authentication with stateless signed session tokens.
  *
- * Password is read from ADMIN_PASSWORD env var (default: "admin").
+ * Password is read from ADMIN_PASSWORD env var (default: "SectionDgroupe6").
  * Uses HMAC-SHA256 signature so tokens can be verified by ANY serverless lambda
  * instance on Vercel or Netlify without requiring shared memory or database.
  */
 
 import { createHmac, randomUUID } from "crypto";
 
-const PASSWORD = process.env.ADMIN_PASSWORD || "admin";
+const PASSWORD = process.env.ADMIN_PASSWORD || "SectionDgroupe6";
 
 /** Active in-memory session tokens for dev / local hot-reloads. */
 const globalKey = "__nftoken_admin_sessions__";
