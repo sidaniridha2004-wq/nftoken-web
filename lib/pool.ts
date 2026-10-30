@@ -48,8 +48,22 @@ export interface PublicPoolEntry {
 // ---------------------------------------------------------------------------
 
 function getKvConfig(): { url: string; token: string } | null {
-  const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
+  let url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
+  let token = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
+
+  if (!url || !token) {
+    for (const [key, val] of Object.entries(process.env)) {
+      if (!val) continue;
+      const upper = key.toUpperCase();
+      if (!url && (upper.endsWith("_REST_URL") || (upper.endsWith("_URL") && val.startsWith("https://")))) {
+        url = val;
+      }
+      if (!token && (upper.endsWith("_REST_TOKEN") || upper.endsWith("_TOKEN"))) {
+        token = val;
+      }
+    }
+  }
+
   if (!url || !token) return null;
   return { url: url.replace(/\/+$/, ""), token: token.trim() };
 }
