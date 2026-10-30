@@ -6,5 +6,6 @@ export const dynamic = "force-dynamic";
 
 /** GET /api/pool — public endpoint returning only working entries (no raw cookies). */
 export async function GET() {
-  return NextResponse.json({ entries: poolPublic() });
+  const entries = await poolPublic();
+  return NextResponse.json({ entries });
 }

@@ -14,7 +14,7 @@ export async function DELETE(
     return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
   }
   const { id } = await params;
-  const removed = poolRemove(id);
+  const removed = await poolRemove(id);
   if (!removed) {
     return NextResponse.json({ error: "Entry not found." }, { status: 404 });
   }

@@ -6,10 +6,10 @@ import { detectCountryLabel, fetchRealCountry } from "@/lib/country";
 import { fetchNftoken, ClientError } from "@/lib/client";
 import {
   poolList,
-  poolAdd,
+  poolAddMany,
   poolClear,
   poolClearDead,
-  poolPatch,
+  isDatabaseConnected,
   type PoolEntry,
 } from "@/lib/pool";
 
@@ -30,7 +30,11 @@ export async function GET(request: Request) {
   if (!verifyAdmin(request)) {
     return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
   }
-  return NextResponse.json({ entries: poolList() });
+  const entries = await poolList();
+  return NextResponse.json({
+    entries,
+    database: isDatabaseConnected() ? "connected" : "local",
+  });
 }
 
 /** POST — add cookies to the pool and auto-check them. */
@@ -96,7 +100,7 @@ export async function POST(request: Request) {
 
         // If no country was in the dump text, live-fetch the REAL account country from Netflix
         if (!entry.country) {
-          const real = await fetchRealCountry(entry.raw, entry.source, entry.loginUrl);
+          const real = await fetchRealCountry(entry.raw, undefined, entry.loginUrl);
           if (real) entry.country = real;
         }
       } catch (err) {
@@ -107,7 +111,6 @@ export async function POST(request: Request) {
       }
 
       results.push(entry);
-      poolAdd(entry);
     }
   }
 
@@ -115,10 +118,21 @@ export async function POST(request: Request) {
     Array.from({ length: Math.min(concurrency, validInputs.length) }, () => checkWorker()),
   );
 
+  if (results.length > 0) {
+    await poolAddMany(results);
+  }
+
   const working = results.filter((r) => r.status === "working").length;
   const dead = results.filter((r) => r.status === "invalid").length;
 
-  return NextResponse.json({ added: results.length, working, dead, entries: poolList() });
+  const currentList = await poolList();
+  return NextResponse.json({
+    added: results.length,
+    working,
+    dead,
+    entries: currentList,
+    database: isDatabaseConnected() ? "connected" : "local",
+  });
 }
 
 /** DELETE — clear pool. ?mode=dead clears only dead entries. */
@@ -129,9 +143,10 @@ export async function DELETE(request: Request) {
   const url = new URL(request.url);
   const mode = url.searchParams.get("mode");
   if (mode === "dead") {
-    const removed = poolClearDead();
-    return NextResponse.json({ removed, entries: poolList() });
+    const removed = await poolClearDead();
+    const entries = await poolList();
+    return NextResponse.json({ removed, entries });
   }
-  const removed = poolClear();
+  const removed = await poolClear();
   return NextResponse.json({ removed });
 }

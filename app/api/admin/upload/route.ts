@@ -4,7 +4,7 @@ import { extractCookiesFromArchive } from "@/lib/archive";
 import { extractCookieDict } from "@/lib/cookies";
 import { netflixIdPreview } from "@/lib/mask";
 import { fetchNftoken, ClientError } from "@/lib/client";
-import { poolAdd, poolList, type PoolEntry } from "@/lib/pool";
+import { poolAddMany, poolList, isDatabaseConnected, type PoolEntry } from "@/lib/pool";
 import { fetchRealCountry } from "@/lib/country";
 
 export const runtime = "nodejs";
@@ -32,29 +32,33 @@ export async function POST(request: Request) {
     formData = await request.formData();
   } catch {
     return NextResponse.json(
-      { error: "Expected multipart/form-data with a 'file' field." },
+      { error: "Expected multipart/form-data with a file." },
       { status: 400 },
     );
   }
 
   const file = formData.get("file");
-  if (!file || !(file instanceof Blob)) {
-    return NextResponse.json({ error: "No file uploaded." }, { status: 400 });
+  if (!file || typeof file === "string") {
+    return NextResponse.json(
+      { error: "Missing archive file (field 'file')." },
+      { status: 400 },
+    );
   }
+
   if (file.size > MAX_ARCHIVE_BYTES) {
     return NextResponse.json(
-      { error: `File too large (max ${MAX_ARCHIVE_BYTES / 1024 / 1024} MB).` },
+      { error: "Archive too large. Max size is 10 MB." },
       { status: 413 },
     );
   }
 
-  let extracted: { source: string; cookie: string; label: string; country?: string }[];
+  let extracted;
   try {
-    const buffer = await file.arrayBuffer();
-    extracted = await extractCookiesFromArchive(buffer);
+    const bytes = await file.arrayBuffer();
+    extracted = await extractCookiesFromArchive(bytes);
   } catch (err) {
     return NextResponse.json(
-      { error: "Failed to extract: " + (err instanceof Error ? err.message : String(err)) },
+      { error: err instanceof Error ? err.message : "Failed to extract archive." },
       { status: 422 },
     );
   }
@@ -67,8 +71,9 @@ export async function POST(request: Request) {
   }
 
   // Deduplicate against existing pool entries.
+  const currentEntries = await poolList();
   const existing = new Set(
-    poolList().map((e) => extractCookieDict(e.raw)["NetflixId"]).filter(Boolean),
+    currentEntries.map((e) => extractCookieDict(e.raw)["NetflixId"]).filter(Boolean),
   );
 
   const fresh = extracted.filter((c) => {
@@ -82,6 +87,8 @@ export async function POST(request: Request) {
       total: extracted.length,
       skipped: extracted.length,
       message: "All cookies already exist in the pool.",
+      entries: currentEntries,
+      database: isDatabaseConnected() ? "connected" : "local",
     });
   }
 
@@ -127,7 +134,6 @@ export async function POST(request: Request) {
       }
 
       results.push(entry);
-      poolAdd(entry);
     }
   }
 
@@ -135,8 +141,14 @@ export async function POST(request: Request) {
     Array.from({ length: Math.min(concurrency, fresh.length) }, () => checkWorker()),
   );
 
+  if (results.length > 0) {
+    await poolAddMany(results);
+  }
+
   const working = results.filter((r) => r.status === "working").length;
   const dead = results.filter((r) => r.status === "invalid").length;
+
+  const updatedList = await poolList();
 
   return NextResponse.json({
     added: results.length,
@@ -144,6 +156,7 @@ export async function POST(request: Request) {
     dead,
     total: extracted.length,
     skipped: extracted.length - fresh.length,
-    entries: poolList(),
+    entries: updatedList,
+    database: isDatabaseConnected() ? "connected" : "local",
   });
 }

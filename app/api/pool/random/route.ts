@@ -5,6 +5,7 @@ import { fetchNftoken, ClientError } from "@/lib/client";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 30;
 
 /**
  * POST /api/pool/random
@@ -12,7 +13,7 @@ export const dynamic = "force-dynamic";
  * a fresh login token on-the-fly, and returns the result.
  */
 export async function POST() {
-  const working = poolGetWorking();
+  const working = await poolGetWorking();
   if (working.length === 0) {
     return NextResponse.json(
       { error: "No working accounts available in the pool right now." },
@@ -28,8 +29,8 @@ export async function POST() {
       const dict = extractCookieDict(entry.raw);
       // Generate a fresh live login URL
       const result = await fetchNftoken(dict);
-      
-      poolPatch(entry.id, {
+
+      await poolPatch(entry.id, {
         status: "working",
         loginUrl: result.login_url,
         expires: result.expires,
@@ -49,22 +50,22 @@ export async function POST() {
         addedAt: entry.addedAt,
       };
 
-      return NextResponse.json(response);
+      return NextResponse.json({ entry: response });
     } catch (err) {
-      // If the cookie has gone bad, mark it dead so it's not shown anymore
+      // If expired, update status so it is no longer picked
       if (err instanceof ClientError) {
-        poolPatch(entry.id, {
+        await poolPatch(entry.id, {
           status: "invalid",
           message: err.message,
           lastChecked: Date.now(),
         });
       }
-      // Continue to next candidate
+      // Continue to next candidate in the shuffled list
     }
   }
 
   return NextResponse.json(
-    { error: "No currently active accounts could be verified. Please check back later." },
-    { status: 404 },
+    { error: "Could not generate a live link. Please try again in a few moments." },
+    { status: 503 },
   );
 }

@@ -2,10 +2,10 @@
  * Server-side pool store with multi-layer persistence.
  *
  * Supports:
- * 1. Seed file (data/pool.json) bundled with deployment for instant cold-start readiness on Vercel & Netlify.
- * 2. In-memory global singleton for zero-latency lookups.
- * 3. /tmp/ filesystem cache for serverless environments.
- * 4. Optional Upstash Redis / Vercel KV remote sync via standard REST API if configured.
+ * 1. Cloud Database: Upstash Redis / Vercel KV via standard REST API.
+ *    Any upload or change is instantly persisted across all phones, PCs, and serverless containers.
+ * 2. Local fallback: /tmp/nftoken_pool.json (for local/testing).
+ * 3. In-memory fast cache with 3s TTL to avoid excessive HTTP requests.
  */
 
 import fs from "fs";
@@ -44,14 +44,81 @@ export interface PublicPoolEntry {
 }
 
 // ---------------------------------------------------------------------------
-// Store & Persistence
+// Database / KV Configuration
 // ---------------------------------------------------------------------------
 
+function getKvConfig(): { url: string; token: string } | null {
+  const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
+  if (!url || !token) return null;
+  return { url: url.replace(/\/+$/, ""), token: token.trim() };
+}
+
+export function isDatabaseConnected(): boolean {
+  return Boolean(getKvConfig());
+}
+
 const poolGlobalKey = "__nftoken_pool_entries__";
-const poolLoadedKey = "__nftoken_pool_loaded__";
+let lastKvFetchTime = 0;
+const KV_CACHE_TTL_MS = 3000; // 3 seconds in-memory TTL
+
+async function loadFromRemoteKV(): Promise<PoolEntry[] | null> {
+  const config = getKvConfig();
+  if (!config) return null;
+
+  try {
+    const res = await fetch(config.url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(["GET", "nftoken_pool"]),
+      signal: AbortSignal.timeout(8000),
+      cache: "no-store",
+    });
+
+    if (!res.ok) {
+      console.error(`Remote KV error ${res.status}: ${res.statusText}`);
+      return null;
+    }
+
+    const data = await res.json();
+    if (!data || data.result === null || data.result === undefined) return null;
+
+    const val = typeof data.result === "string" ? JSON.parse(data.result) : data.result;
+    if (Array.isArray(val)) return val;
+  } catch (err) {
+    console.error("Failed to read from Remote KV:", err);
+  }
+  return null;
+}
+
+async function saveToRemoteKV(entries: PoolEntry[]): Promise<boolean> {
+  const config = getKvConfig();
+  if (!config) return false;
+
+  try {
+    const res = await fetch(config.url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(["SET", "nftoken_pool", JSON.stringify(entries)]),
+      signal: AbortSignal.timeout(12000),
+      cache: "no-store",
+    });
+
+    return res.ok;
+  } catch (err) {
+    console.error("Failed to write to Remote KV:", err);
+    return false;
+  }
+}
 
 function loadInitialFromDisk(): PoolEntry[] {
-  // 1. Check /tmp (if serverless instance previously saved updates)
+  // Check writable tmp path
   const tmpPath = path.join("/tmp", "nftoken_pool.json");
   try {
     if (fs.existsSync(tmpPath)) {
@@ -61,7 +128,7 @@ function loadInitialFromDisk(): PoolEntry[] {
     }
   } catch {}
 
-  // 2. Check bundled data directory
+  // Check bundled data directory
   const possiblePaths = [
     path.join(process.cwd(), "data", "pool.json"),
     path.join(__dirname, "..", "data", "pool.json"),
@@ -80,74 +147,54 @@ function loadInitialFromDisk(): PoolEntry[] {
   return [];
 }
 
-function syncToRemoteKV(entries: PoolEntry[]): void {
-  const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
-  if (!url || !token) return;
+async function savePool(entries: PoolEntry[]): Promise<void> {
+  const json = JSON.stringify(entries);
 
-  fetch(`${url}/set/nftoken_pool`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(entries),
-  }).catch(() => {});
-}
+  // 1. Save to Remote KV (Upstash Redis / Vercel KV) if available
+  const savedRemote = await saveToRemoteKV(entries);
 
-let kvCheckInitiated = false;
-function checkRemoteKV(): void {
-  if (kvCheckInitiated) return;
-  kvCheckInitiated = true;
-
-  const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
-  if (!url || !token) return;
-
-  fetch(`${url}/get/nftoken_pool`, {
-    headers: { Authorization: `Bearer ${token}` },
-  })
-    .then((res) => (res.ok ? res.json() : null))
-    .then((data) => {
-      if (!data) return;
-      const rawVal = data.result;
-      const val = typeof rawVal === "string" ? JSON.parse(rawVal) : rawVal;
-      if (Array.isArray(val) && val.length > 0) {
-        const current = getPoolEntries();
-        current.length = 0;
-        current.push(...val);
-      }
-    })
-    .catch(() => {});
-}
-
-function savePool(entries: PoolEntry[]): void {
-  const json = JSON.stringify(entries, null, 2);
-
-  // Try writing to data/pool.json (works in local dev / Docker / VPS)
+  // 2. Also try writing local disk / tmp
   try {
     const dataDir = path.join(process.cwd(), "data");
     if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-    fs.writeFileSync(path.join(dataDir, "pool.json"), json, "utf-8");
+    fs.writeFileSync(path.join(dataDir, "pool.json"), JSON.stringify(entries, null, 2), "utf-8");
   } catch {
-    // Read-only serverless filesystem (Vercel / Netlify): fallback to /tmp
     try {
       fs.writeFileSync(path.join("/tmp", "nftoken_pool.json"), json, "utf-8");
     } catch {}
   }
 
-  // Sync to remote KV if credentials are provided
-  syncToRemoteKV(entries);
+  if (!savedRemote && !isDatabaseConnected()) {
+    console.warn(
+      "[nftoken] Notice: No remote database connected. Entries will stay in RAM only. " +
+      "Connect Upstash Redis or Vercel KV via UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN " +
+      "to persist pool across all devices and serverless cold starts."
+    );
+  }
 }
 
-function getPoolEntries(): PoolEntry[] {
+async function getPoolEntries(): Promise<PoolEntry[]> {
   const g = globalThis as unknown as Record<string, unknown>;
-  if (!g[poolGlobalKey]) {
-    const initial = loadInitialFromDisk();
-    g[poolGlobalKey] = initial;
-    g[poolLoadedKey] = true;
-    checkRemoteKV();
+  const now = Date.now();
+
+  const config = getKvConfig();
+  if (config) {
+    // If not loaded or cache has expired, pull latest database state
+    if (!g[poolGlobalKey] || now - lastKvFetchTime > KV_CACHE_TTL_MS) {
+      const remote = await loadFromRemoteKV();
+      if (remote !== null) {
+        g[poolGlobalKey] = remote;
+        lastKvFetchTime = now;
+        return remote;
+      }
+    }
   }
+
+  if (!g[poolGlobalKey]) {
+    g[poolGlobalKey] = loadInitialFromDisk();
+    lastKvFetchTime = now;
+  }
+
   return g[poolGlobalKey] as PoolEntry[];
 }
 
@@ -177,7 +224,7 @@ async function resolveMissingLive(entries: PoolEntry[]) {
     await Promise.all(
       Array.from({ length: Math.min(concurrency, missing.length) }, () => worker()),
     );
-    savePool(entries);
+    await savePool(entries);
   } catch {
     // ignore
   } finally {
@@ -202,52 +249,52 @@ function ensureCountries(entries: PoolEntry[]): void {
   }
 }
 
-export function poolList(): PoolEntry[] {
-  const entries = getPoolEntries();
+export async function poolList(): Promise<PoolEntry[]> {
+  const entries = await getPoolEntries();
   ensureCountries(entries);
   return entries;
 }
 
-export function poolAdd(entry: PoolEntry): void {
-  const entries = getPoolEntries();
+export async function poolAdd(entry: PoolEntry): Promise<void> {
+  const entries = await getPoolEntries();
   entries.push(entry);
-  savePool(entries);
+  await savePool(entries);
 }
 
-export function poolAddMany(batch: PoolEntry[]): void {
-  const entries = getPoolEntries();
+export async function poolAddMany(batch: PoolEntry[]): Promise<void> {
+  const entries = await getPoolEntries();
   entries.push(...batch);
-  savePool(entries);
+  await savePool(entries);
 }
 
-export function poolRemove(id: string): boolean {
-  const entries = getPoolEntries();
+export async function poolRemove(id: string): Promise<boolean> {
+  const entries = await getPoolEntries();
   const idx = entries.findIndex((e) => e.id === id);
   if (idx === -1) return false;
   entries.splice(idx, 1);
-  savePool(entries);
+  await savePool(entries);
   return true;
 }
 
-export function poolPatch(id: string, changes: Partial<PoolEntry>): boolean {
-  const entries = getPoolEntries();
+export async function poolPatch(id: string, changes: Partial<PoolEntry>): Promise<boolean> {
+  const entries = await getPoolEntries();
   const entry = entries.find((e) => e.id === id);
   if (!entry) return false;
   Object.assign(entry, changes);
-  savePool(entries);
+  await savePool(entries);
   return true;
 }
 
-export function poolClear(): number {
-  const entries = getPoolEntries();
+export async function poolClear(): Promise<number> {
+  const entries = await getPoolEntries();
   const count = entries.length;
   entries.length = 0;
-  savePool(entries);
+  await savePool(entries);
   return count;
 }
 
-export function poolClearDead(): number {
-  const entries = getPoolEntries();
+export async function poolClearDead(): Promise<number> {
+  const entries = await getPoolEntries();
   let removed = 0;
   for (let i = entries.length - 1; i >= 0; i--) {
     if (entries[i].status === "invalid") {
@@ -255,23 +302,24 @@ export function poolClearDead(): number {
       removed++;
     }
   }
-  if (removed > 0) savePool(entries);
+  if (removed > 0) await savePool(entries);
   return removed;
 }
 
-export function poolGet(id: string): PoolEntry | undefined {
-  return getPoolEntries().find((e) => e.id === id);
+export async function poolGet(id: string): Promise<PoolEntry | undefined> {
+  const entries = await getPoolEntries();
+  return entries.find((e) => e.id === id);
 }
 
-export function poolGetWorking(): PoolEntry[] {
-  const entries = getPoolEntries();
+export async function poolGetWorking(): Promise<PoolEntry[]> {
+  const entries = await getPoolEntries();
   ensureCountries(entries);
   return entries.filter((e) => e.status === "working");
 }
 
 /** Return only working entries with sensitive fields stripped. */
-export function poolPublic(): PublicPoolEntry[] {
-  const entries = getPoolEntries();
+export async function poolPublic(): Promise<PublicPoolEntry[]> {
+  const entries = await getPoolEntries();
   ensureCountries(entries);
   return entries
     .filter((e) => e.status === "working")

@@ -39,13 +39,12 @@ async function apiLogin(password: string): Promise<{ token?: string; error?: str
   return res.json();
 }
 
-async function apiGetPool(token: string): Promise<PoolEntry[]> {
+async function apiGetPool(token: string): Promise<{ entries: PoolEntry[]; database?: "connected" | "local" }> {
   const res = await fetch("/api/admin/pool", {
     headers: authHeaders(token),
   });
   if (!res.ok) throw new Error("Unauthorized");
-  const data = await res.json();
-  return data.entries ?? [];
+  return res.json();
 }
 
 async function apiAddCookies(
@@ -209,6 +208,7 @@ function AdminDashboard({
   onLogout: () => void;
 }) {
   const [entries, setEntries] = useState<PoolEntry[]>([]);
+  const [dbStatus, setDbStatus] = useState<"connected" | "local">("local");
   const [bulk, setBulk] = useState("");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -217,8 +217,9 @@ function AdminDashboard({
 
   const refresh = useCallback(async () => {
     try {
-      const list = await apiGetPool(token);
-      setEntries(list);
+      const data = await apiGetPool(token);
+      setEntries(data.entries ?? []);
+      if (data.database) setDbStatus(data.database);
     } catch {
       onLogout();
     }
@@ -331,8 +332,19 @@ function AdminDashboard({
     <div className="main-content" style={{ minHeight: "100vh" }}>
       {/* Topbar */}
       <header className="topbar">
-        <div className="breadcrumb">
-          Admin / <span>Pool Management</span>
+        <div className="breadcrumb" style={{ display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap" }}>
+          <span>Admin / <span>Pool Management</span></span>
+          {dbStatus === "connected" ? (
+            <span style={{ padding: "3px 10px", borderRadius: "999px", background: "rgba(34,197,94,0.12)", color: "#22c55e", border: "1px solid rgba(34,197,94,0.3)", fontSize: "0.74rem", fontWeight: 600, display: "inline-flex", alignItems: "center", gap: "6px" }}>
+              <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: "#22c55e" }} />
+              Cloud Database Active
+            </span>
+          ) : (
+            <span title="To keep cookies permanently across all phones and serverless cold starts on Vercel/Netlify, connect free Upstash Redis." style={{ padding: "3px 10px", borderRadius: "999px", background: "rgba(234,179,8,0.12)", color: "#eab308", border: "1px solid rgba(234,179,8,0.3)", fontSize: "0.74rem", fontWeight: 600, display: "inline-flex", alignItems: "center", gap: "6px" }}>
+              <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: "#eab308" }} />
+              Local Storage Mode
+            </span>
+          )}
         </div>
         <div className="topbar-actions">
           <a
