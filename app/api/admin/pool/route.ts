@@ -37,10 +37,23 @@ export async function GET(request: Request) {
   });
 }
 
-/** POST — add cookies to the pool and auto-check them. */
+/** POST — add cookies to the pool, or recheck existing pool. */
 export async function POST(request: Request) {
   if (!verifyAdmin(request)) {
     return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
+  }
+
+  const url = new URL(request.url);
+  if (url.searchParams.get("action") === "recheck") {
+    const { poolRecheck } = await import("@/lib/pool");
+    const result = await poolRecheck();
+    const entries = await poolList();
+    return NextResponse.json({
+      ok: true,
+      result,
+      entries,
+      database: isDatabaseConnected() ? "connected" : "local",
+    });
   }
 
   let body: unknown;

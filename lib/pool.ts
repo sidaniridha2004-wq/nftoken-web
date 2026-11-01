@@ -1,16 +1,18 @@
 /**
- * Server-side pool store with multi-layer persistence.
+ * Server-side pool store with multi-layer persistence and auto-refresh.
  *
  * Supports:
  * 1. Cloud Database: Upstash Redis / Vercel KV via standard REST API.
- *    Any upload or change is instantly persisted across all phones, PCs, and serverless containers.
- * 2. Local fallback: /tmp/nftoken_pool.json (for local/testing).
- * 3. In-memory fast cache with 3s TTL to avoid excessive HTTP requests.
+ * 2. Automatic 30-minute recheck and refresh of tokens.
+ * 3. Fresh on-the-fly token generation for 1-tap logins.
+ * 4. Local fallback: /tmp/nftoken_pool.json and data/pool.json.
  */
 
 import fs from "fs";
 import path from "path";
 import { detectCountryLabel, fetchCountryViaLoginUrl } from "./country";
+import { extractCookieDict } from "./cookies";
+import { fetchNftoken, ClientError } from "./client";
 
 export type PoolStatus = "working" | "invalid" | "error" | "unchecked";
 
@@ -93,7 +95,6 @@ async function loadFromRemoteKV(): Promise<PoolEntry[] | null> {
     });
 
     if (!res.ok) {
-      console.error(`Remote KV error ${res.status}: ${res.statusText}`);
       return null;
     }
 
@@ -165,7 +166,7 @@ async function savePool(entries: PoolEntry[]): Promise<void> {
   const json = JSON.stringify(entries);
 
   // 1. Save to Remote KV (Upstash Redis / Vercel KV) if available
-  const savedRemote = await saveToRemoteKV(entries);
+  await saveToRemoteKV(entries);
 
   // 2. Also try writing local disk / tmp
   try {
@@ -176,14 +177,6 @@ async function savePool(entries: PoolEntry[]): Promise<void> {
     try {
       fs.writeFileSync(path.join("/tmp", "nftoken_pool.json"), json, "utf-8");
     } catch {}
-  }
-
-  if (!savedRemote && !isDatabaseConnected()) {
-    console.warn(
-      "[nftoken] Notice: No remote database connected. Entries will stay in RAM only. " +
-      "Connect Upstash Redis or Vercel KV via UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN " +
-      "to persist pool across all devices and serverless cold starts."
-    );
   }
 }
 
@@ -263,9 +256,95 @@ function ensureCountries(entries: PoolEntry[]): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 30-Minute Automatic Recheck Engine
+// ---------------------------------------------------------------------------
+
+let isRechecking = false;
+let lastAutoRecheckTime = 0;
+const AUTO_RECHECK_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+
+export async function poolRecheck(batchLimit: number = 50): Promise<{ total: number; working: number; dead: number; checked: number }> {
+  if (isRechecking) {
+    const list = await getPoolEntries();
+    return {
+      total: list.length,
+      working: list.filter((e) => e.status === "working").length,
+      dead: list.filter((e) => e.status === "invalid").length,
+      checked: 0,
+    };
+  }
+
+  isRechecking = true;
+  lastAutoRecheckTime = Date.now();
+
+  try {
+    const entries = await getPoolEntries();
+    if (entries.length === 0) {
+      return { total: 0, working: 0, dead: 0, checked: 0 };
+    }
+
+    // Prioritize checking accounts that haven't been checked in the longest time or are expired
+    const validEntries = [...entries]
+      .filter((e) => e.raw && e.raw.trim().length > 0)
+      .sort((a, b) => (a.lastChecked || 0) - (b.lastChecked || 0));
+
+    const toCheck = validEntries.slice(0, batchLimit);
+    const concurrency = 6;
+    let idx = 0;
+    let checkedCount = 0;
+
+    const worker = async () => {
+      while (idx < toCheck.length) {
+        const entry = toCheck[idx++];
+        if (!entry) continue;
+        try {
+          const dict = extractCookieDict(entry.raw);
+          const result = await fetchNftoken(dict);
+          entry.status = "working";
+          entry.loginUrl = result.login_url;
+          entry.expires = result.expires;
+          entry.expiryText = result.expiry_text;
+          entry.lastChecked = Date.now();
+        } catch (err) {
+          const isClient = err instanceof ClientError;
+          entry.status = isClient ? "invalid" : "error";
+          entry.message = err instanceof Error ? err.message : String(err);
+          entry.lastChecked = Date.now();
+        }
+        checkedCount++;
+      }
+    };
+
+    await Promise.all(
+      Array.from({ length: Math.min(concurrency, toCheck.length) }, () => worker()),
+    );
+
+    await savePool(entries);
+
+    const working = entries.filter((e) => e.status === "working").length;
+    const dead = entries.filter((e) => e.status === "invalid").length;
+    return { total: entries.length, working, dead, checked: checkedCount };
+  } finally {
+    isRechecking = false;
+  }
+}
+
+export function triggerAutoRecheckIfNeeded(): void {
+  const now = Date.now();
+  if (lastAutoRecheckTime === 0) {
+    lastAutoRecheckTime = now;
+    return;
+  }
+  if (now - lastAutoRecheckTime >= AUTO_RECHECK_INTERVAL_MS && !isRechecking) {
+    void poolRecheck();
+  }
+}
+
 export async function poolList(): Promise<PoolEntry[]> {
   const entries = await getPoolEntries();
   ensureCountries(entries);
+  triggerAutoRecheckIfNeeded();
   return entries;
 }
 
@@ -328,13 +407,50 @@ export async function poolGet(id: string): Promise<PoolEntry | undefined> {
 export async function poolGetWorking(): Promise<PoolEntry[]> {
   const entries = await getPoolEntries();
   ensureCountries(entries);
+  triggerAutoRecheckIfNeeded();
   return entries.filter((e) => e.status === "working");
+}
+
+/**
+ * Mint a fresh live login URL for an entry on-demand.
+ * Used when a user clicks "Open" or "Copy" on a specific card.
+ */
+export async function poolMintFreshToken(id: string): Promise<{ loginUrl: string; expires?: number | null; expiryText?: string } | null> {
+  const entry = await poolGet(id);
+  if (!entry || !entry.raw) return null;
+
+  try {
+    const dict = extractCookieDict(entry.raw);
+    const result = await fetchNftoken(dict);
+    await poolPatch(entry.id, {
+      status: "working",
+      loginUrl: result.login_url,
+      expires: result.expires,
+      expiryText: result.expiry_text,
+      lastChecked: Date.now(),
+    });
+    return {
+      loginUrl: result.login_url,
+      expires: result.expires,
+      expiryText: result.expiry_text,
+    };
+  } catch (err) {
+    if (err instanceof ClientError) {
+      await poolPatch(entry.id, {
+        status: "invalid",
+        message: err.message,
+        lastChecked: Date.now(),
+      });
+    }
+    return null;
+  }
 }
 
 /** Return only working entries with sensitive fields stripped. */
 export async function poolPublic(): Promise<PublicPoolEntry[]> {
   const entries = await getPoolEntries();
   ensureCountries(entries);
+  triggerAutoRecheckIfNeeded();
   return entries
     .filter((e) => e.status === "working")
     .map(({ id, label, country, preview, status, loginUrl, expires, expiryText, addedAt }) => ({

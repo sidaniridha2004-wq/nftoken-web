@@ -91,10 +91,11 @@ export default function Page() {
         setRandomError(data.error || "Could not generate a live link.");
         return;
       }
-      setRandomEntry(data);
-      if (data.loginUrl) {
+      const entry = data.entry || data;
+      setRandomEntry(entry);
+      if (entry.loginUrl) {
         try {
-          await navigator.clipboard.writeText(data.loginUrl);
+          await navigator.clipboard.writeText(entry.loginUrl);
           setRandomCopied(true);
           setTimeout(() => setRandomCopied(false), 2000);
         } catch {
@@ -120,6 +121,24 @@ export default function Page() {
       }
     } catch {
       /* clipboard blocked */
+    }
+  }
+
+  async function handleCopyCardLink(id: string, fallbackUrl?: string) {
+    try {
+      const res = await fetch(`/api/pool/${id}/login`, { method: "POST" });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.loginUrl) {
+          await copyToClipboard(data.loginUrl, id);
+          return;
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    if (fallbackUrl) {
+      await copyToClipboard(fallbackUrl, id);
     }
   }
 
@@ -657,25 +676,22 @@ export default function Page() {
                         </div>
                       </div>
                       <div className="cdc-actions">
-                        {c.loginUrl && (
-                          <>
-                            <a
-                              className="btn-launch"
-                              href={c.loginUrl}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                            >
-                              🚀 Open
-                            </a>
-                            <button
-                              type="button"
-                              className="btn-secondary"
-                              onClick={() => copyToClipboard(c.loginUrl, c.id)}
-                            >
-                              {copiedId === c.id ? "copied ✓" : "copy"}
-                            </button>
-                          </>
-                        )}
+                        <a
+                          className="btn-launch"
+                          href={`/api/pool/${c.id}/login`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          title="Opens Netflix with a freshly minted session token"
+                        >
+                          🚀 Open
+                        </a>
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          onClick={() => handleCopyCardLink(c.id, c.loginUrl)}
+                        >
+                          {copiedId === c.id ? "copied ✓" : "copy"}
+                        </button>
                       </div>
                     </div>
                   ))}

@@ -305,6 +305,32 @@ function AdminDashboard({
     }
   }
 
+  async function handleRecheckPool() {
+    setBusy(true);
+    setMessage("⏳ Rechecking all accounts live against Netflix and generating fresh tokens…");
+    try {
+      const res = await fetch("/api/admin/pool?action=recheck", {
+        method: "POST",
+        headers: authHeaders(token),
+      });
+      const data = await res.json();
+      if (data.ok && data.result) {
+        setMessage(
+          `✓ Pool rechecked! ${data.result.working} working · ${data.result.dead} dead · tokens freshly minted. Auto-refresh runs every 30 mins.`
+        );
+        if (data.entries) setEntries(data.entries);
+        else await refresh();
+      } else {
+        setMessage("Recheck completed.");
+        await refresh();
+      }
+    } catch {
+      setMessage("Failed to recheck pool.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function handleClearAll() {
     if (!window.confirm("Remove ALL entries from the shared pool?")) return;
     setBusy(true);
@@ -502,6 +528,16 @@ function AdminDashboard({
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
               />
+              <button
+                type="button"
+                className="btn-primary"
+                style={{ padding: "6px 12px", fontSize: "0.82rem" }}
+                onClick={handleRecheckPool}
+                disabled={busy || entries.length === 0}
+                title="Tests all cookies live against Netflix, generates fresh tokens, and removes dead accounts"
+              >
+                {busy ? "Checking…" : "🔄 Recheck Pool"}
+              </button>
               <button
                 type="button"
                 className="btn-secondary"
