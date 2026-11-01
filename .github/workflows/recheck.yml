@@ -1,0 +1,21 @@
+name: 30-Minute Pool Recheck
+
+on:
+  schedule:
+    # Runs every 30 minutes (free on GitHub Actions)
+    - cron: '*/30 * * * *'
+  workflow_dispatch: # Allows manual trigger from GitHub Actions tab
+
+jobs:
+  recheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Cron Endpoint
+        run: |
+          if [ -n "${{ secrets.SITE_URL }}" ]; then
+            URL="${{ secrets.SITE_URL }}/api/cron/check"
+            echo "Pinging $URL..."
+            curl -s -f "$URL" || echo "Warning: ping returned non-200"
+          else
+            echo "Notice: SITE_URL secret not set. Skipping external ping (in-app auto-recheck is active)."
+          fi
